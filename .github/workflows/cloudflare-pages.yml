@@ -29,6 +29,23 @@ jobs:
       - name: Prepare output directory
         run: mkdir -p output
 
+      - name: Restore seeded history
+        run: |
+          if [ -f data/history-seed.tar.gz ]; then
+            tar -xzf data/history-seed.tar.gz -C output
+          fi
+
+      - name: Restore generated history cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            output/news
+            output/rss
+            output/markets
+          key: newshot-history-${{ github.run_id }}
+          restore-keys: |
+            newshot-history-
+
       - name: Run upstream TrendRadar crawler
         run: >-
           docker run --rm
@@ -59,6 +76,16 @@ jobs:
 
       - name: Add Cloudflare Pages headers
         run: cp cloudflare/pages/_headers output/_headers
+
+      - name: Save generated history cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            output/news
+            output/rss
+            output/markets
+          key: newshot-history-${{ github.run_id }}
 
       - name: Ensure Cloudflare Pages project exists
         run: npx wrangler pages project create "$CLOUDFLARE_PAGES_PROJECT" --production-branch main || true
