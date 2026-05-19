@@ -1,0 +1,37 @@
+name = "newshot-live-data"
+main = "src/worker.js"
+compatibility_date = "2026-05-19"
+workers_dev = true
+
+[triggers]
+crons = ["*/10 * * * *"]
+
+[[kv_namespaces]]
+binding = "NEWSHOT_KV"
+id = "replace_with_kv_namespace_id"
+
+[vars]
+REFRESH_SECONDS = "600"
+CORS_ORIGIN = "*"
+WATCHLIST_JSON = """
+[
+  {
+    "id": "pingan_bank",
+    "name": "平安银行",
+    "symbol": "sz000001",
+    "type": "tencent_stock",
+    "market": "深交所",
+    "unit": "元",
+    "url": "https://gu.qq.com/sz000001/gp"
+  },
+  {
+    "id": "gold_spot",
+    "name": "现货黄金",
+    "symbol": "hf_XAU",
+    "type": "tencent_global",
+    "market": "贵金属",
+    "unit": "美元/盎司",
+    "url": "https://gu.qq.com/hf/hf_XAU"
+  }
+]
+"""

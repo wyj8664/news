@@ -1,0 +1,55 @@
+services:
+  trendradar:
+    image: wantcat/trendradar:latest
+    container_name: trendradar
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      RUN_MODE: cron
+      CRON_SCHEDULE: "*/30 * * * *"
+      IMMEDIATE_RUN: "false"
+      DOCKER_CONTAINER: "true"
+      SCHEDULE_ENABLED: "false"
+      AI_ANALYSIS_ENABLED: "false"
+      AI_TRANSLATION_ENABLED: "false"
+      STORAGE_TXT_ENABLED: "true"
+      STORAGE_HTML_ENABLED: "true"
+      WEBSERVER_PORT: "8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/app/config:ro
+      - ./output:/app/output
+  daily-digest:
+    image: wantcat/trendradar:latest
+    container_name: trendradar-daily-digest
+    restart: unless-stopped
+    working_dir: /workspace
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          python /workspace/tools/market_quotes.py --output-root /workspace/output --watchlist /workspace/config/market_watchlist.json
+          python /workspace/tools/curated_events.py --output-root /workspace/output --lookback-days 7 --home-top 24 --daily-top 50 --skip-daily
+          python /workspace/tools/daily_digest.py --output-root /workspace/output --top 50 --all
+          i=0
+          while [ "$$i" -lt 30 ]; do
+            if [ "$$((i % 6))" -eq 0 ]; then
+              python /workspace/tools/market_quotes.py --output-root /workspace/output --watchlist /workspace/config/market_watchlist.json
+            fi
+            if [ -f /workspace/output/curated/index.html ] && ! grep -q "今日领域分类" /workspace/output/index.html 2>/dev/null; then
+              cp /workspace/output/curated/index.html /workspace/output/index.html
+              echo "[curated] restored curated home"
+            fi
+            if ! grep -q "NEWSHOT_SOURCE_PAGE" /workspace/output/html/latest/current.html 2>/dev/null; then
+              python /workspace/tools/curated_events.py --output-root /workspace/output --lookback-days 7 --hotlists-only
+              echo "[hotlists] restored styled source page"
+            fi
+            i=$$((i + 1))
+            sleep 10
+          done
+        done
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./:/workspace

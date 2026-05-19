@@ -1,0 +1,67 @@
+name: Deploy NEWSHOT to Cloudflare Pages
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */2 * * *"
+
+concurrency:
+  group: cloudflare-pages
+  cancel-in-progress: true
+
+env:
+  CLOUDFLARE_PAGES_PROJECT: newshot
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Prepare output directory
+        run: mkdir -p output
+
+      - name: Run upstream TrendRadar crawler
+        run: >-
+          docker run --rm
+          --entrypoint python
+          -e TZ=Asia/Shanghai
+          -e DOCKER_CONTAINER=true
+          -e SCHEDULE_ENABLED=false
+          -e AI_ANALYSIS_ENABLED=false
+          -e AI_TRANSLATION_ENABLED=false
+          -e STORAGE_TXT_ENABLED=true
+          -e STORAGE_HTML_ENABLED=true
+          -v "$PWD/config:/app/config:ro"
+          -v "$PWD/output:/app/output"
+          wantcat/trendradar:latest
+          manage.py run
+
+      - name: Fix generated file ownership
+        run: sudo chown -R "$USER:$USER" output
+
+      - name: Generate market quotes
+        run: python3 tools/market_quotes.py --output-root output --watchlist config/market_watchlist.json
+
+      - name: Generate curated pages
+        run: python3 tools/curated_events.py --output-root output --lookback-days 7 --home-top 24 --daily-top 50 --skip-daily
+
+      - name: Generate daily pages
+        run: python3 tools/daily_digest.py --output-root output --top 50 --all
+
+      - name: Add Cloudflare Pages headers
+        run: cp cloudflare/pages/_headers output/_headers
+
+      - name: Deploy to Cloudflare Pages
+        run: npx wrangler pages deploy output --project-name "$CLOUDFLARE_PAGES_PROJECT"
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

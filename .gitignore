@@ -1,0 +1,8 @@
+output/
+*.pyc
+__pycache__/
+.DS_Store
+.env
+cloudflare/worker/wrangler.toml
+node_modules/
+.wrangler/

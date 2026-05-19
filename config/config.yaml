@@ -1,0 +1,198 @@
+app:
+  timezone: "Asia/Shanghai"
+  show_version_update: false
+
+schedule:
+  enabled: false
+  preset: "always_on"
+
+platforms:
+  enabled: true
+  sources:
+    - id: "toutiao"
+      name: "今日头条"
+    - id: "baidu"
+      name: "百度热搜"
+    - id: "weibo"
+      name: "微博"
+    - id: "zhihu"
+      name: "知乎"
+    - id: "douyin"
+      name: "抖音"
+    - id: "thepaper"
+      name: "澎湃新闻"
+    - id: "ifeng"
+      name: "凤凰网"
+    - id: "wallstreetcn-hot"
+      name: "华尔街见闻"
+    - id: "cls-hot"
+      name: "财联社热门"
+    - id: "bilibili-hot-search"
+      name: "Bilibili 热搜"
+    - id: "xueqiu-hotstock"
+      name: "雪球热门股票"
+
+rss:
+  enabled: true
+  freshness_filter:
+    enabled: true
+    max_age_days: 1
+  feeds:
+    - id: "sina-finance"
+      name: "新浪财经国内滚动"
+      url: "https://rsshub.rssforever.com/sina/finance/china"
+
+report:
+  mode: "current"
+  display_mode: "platform"
+  sort_by_position_first: false
+  rank_threshold: 5
+  max_news_per_keyword: 0
+
+filter:
+  method: "keyword"
+  priority_sort_enabled: false
+
+ai_filter:
+  batch_size: 200
+  batch_interval: 2
+  min_score: 0.7
+  reclassify_threshold: 0.6
+
+display:
+  region_order:
+    - standalone
+    - hotlist
+    - rss
+    - new_items
+    - ai_analysis
+  regions:
+    hotlist: true
+    new_items: false
+    rss: true
+    standalone: true
+    ai_analysis: false
+  standalone:
+    platforms:
+      - "toutiao"
+      - "baidu"
+      - "weibo"
+      - "zhihu"
+      - "douyin"
+      - "thepaper"
+      - "ifeng"
+      - "wallstreetcn-hot"
+      - "cls-hot"
+      - "bilibili-hot-search"
+      - "xueqiu-hotstock"
+    rss_feeds:
+      - "sina-finance"
+    max_items: 20
+
+notification:
+  enabled: false
+  channels:
+    feishu:
+      webhook_url: ""
+    dingtalk:
+      webhook_url: ""
+    wework:
+      webhook_url: ""
+      msg_type: "markdown"
+    telegram:
+      bot_token: ""
+      chat_id: ""
+    email:
+      from: ""
+      password: ""
+      to: ""
+      smtp_server: ""
+      smtp_port: ""
+    ntfy:
+      server_url: "https://ntfy.sh"
+      topic: ""
+      token: ""
+    bark:
+      url: ""
+    slack:
+      webhook_url: ""
+    generic_webhook:
+      webhook_url: ""
+      payload_template: ""
+
+storage:
+  backend: "local"
+  formats:
+    sqlite: true
+    txt: true
+    html: true
+  local:
+    data_dir: "output"
+    retention_days: 0
+  remote:
+    retention_days: 0
+    endpoint_url: ""
+    bucket_name: ""
+    access_key_id: ""
+    secret_access_key: ""
+    region: ""
+  pull:
+    enabled: false
+    days: 7
+
+ai:
+  model: ""
+  api_key: ""
+  api_base: ""
+  timeout: 120
+  temperature: 1.0
+  max_tokens: 5000
+  num_retries: 1
+  fallback_models: []
+
+ai_analysis:
+  enabled: false
+  language: "Chinese"
+  prompt_file: "ai_analysis_prompt.txt"
+  mode: "follow_report"
+  max_news_for_analysis: 100
+  include_rss: false
+  include_standalone: false
+  include_rank_timeline: false
+
+ai_translation:
+  enabled: false
+  language: "中文"
+  prompt_file: "ai_translation_prompt.txt"
+  scope:
+    hotlist: false
+    rss: false
+    standalone: false
+
+advanced:
+  debug: false
+  version_check_url: ""
+  configs_version_check_url: ""
+  mcp_version_check_url: ""
+  crawler:
+    request_interval: 1200
+    use_proxy: false
+    default_proxy: ""
+  rss:
+    request_interval: 1000
+    timeout: 15
+    use_proxy: false
+    proxy_url: ""
+  weight:
+    rank: 0.6
+    frequency: 0.3
+    hotness: 0.1
+  max_accounts_per_channel: 3
+  batch_size:
+    default: 4000
+    dingtalk: 20000
+    feishu: 30000
+    bark: 4000
+    slack: 4000
+  batch_send_interval: 3
+  feishu_message_separator: "----------------"
