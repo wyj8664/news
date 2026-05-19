@@ -29,12 +29,6 @@ jobs:
       - name: Prepare output directory
         run: mkdir -p output
 
-      - name: Restore seeded history
-        run: |
-          if [ -f data/history-seed.tar.gz ]; then
-            tar -xzf data/history-seed.tar.gz -C output
-          fi
-
       - name: Restore generated history cache
         uses: actions/cache/restore@v4
         with:
@@ -45,6 +39,28 @@ jobs:
           key: newshot-history-${{ github.run_id }}
           restore-keys: |
             newshot-history-
+
+      - name: Restore seeded history
+        run: |
+          if [ -f data/history-seed.tar.gz ]; then
+            tar -xzf data/history-seed.tar.gz -C output
+          fi
+
+      - name: Validate history databases
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for folder in ("output/news", "output/rss"):
+              for path in Path(folder).glob("*.db"):
+                  try:
+                      header = path.read_bytes()[:16]
+                  except OSError:
+                      continue
+                  if header != b"SQLite format 3\x00":
+                      print(f"Removing invalid history file: {path}")
+                      path.unlink()
+          PY
 
       - name: Run upstream TrendRadar crawler
         run: >-

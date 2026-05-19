@@ -8,6 +8,7 @@ import html
 import math
 import re
 import sqlite3
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -180,10 +181,25 @@ def strip_summary(summary: str, limit: int = 120) -> str:
     return summary
 
 
+def is_sqlite_database(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            return handle.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
+
+
 def connect_if_exists(path: Path) -> sqlite3.Connection | None:
     if not path.exists():
         return None
-    conn = sqlite3.connect(path)
+    if not is_sqlite_database(path):
+        print(f"[daily] skip invalid sqlite file: {path}", file=sys.stderr)
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.DatabaseError as exc:
+        print(f"[daily] skip unreadable sqlite file: {path} ({exc})", file=sys.stderr)
+        return None
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -192,28 +208,33 @@ def load_hotlist_items(db_path: Path) -> list[Item]:
     conn = connect_if_exists(db_path)
     if conn is None:
         return []
-    rows = conn.execute(
-        """
-        SELECT
-            n.id,
-            n.title,
-            n.platform_id,
-            COALESCE(p.name, n.platform_id) AS source_name,
-            n.rank,
-            n.url,
-            n.first_crawl_time,
-            n.last_crawl_time,
-            n.crawl_count,
-            MIN(r.rank) AS best_rank,
-            MAX(r.rank) AS worst_rank,
-            COUNT(r.id) AS rank_points
-        FROM news_items n
-        LEFT JOIN platforms p ON p.id = n.platform_id
-        LEFT JOIN rank_history r ON r.news_item_id = n.id
-        GROUP BY n.id
-        """
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                n.id,
+                n.title,
+                n.platform_id,
+                COALESCE(p.name, n.platform_id) AS source_name,
+                n.rank,
+                n.url,
+                n.first_crawl_time,
+                n.last_crawl_time,
+                n.crawl_count,
+                MIN(r.rank) AS best_rank,
+                MAX(r.rank) AS worst_rank,
+                COUNT(r.id) AS rank_points
+            FROM news_items n
+            LEFT JOIN platforms p ON p.id = n.platform_id
+            LEFT JOIN rank_history r ON r.news_item_id = n.id
+            GROUP BY n.id
+            """
+        ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        print(f"[daily] skip hotlist database: {db_path} ({exc})", file=sys.stderr)
+        rows = []
+    finally:
+        conn.close()
 
     items: list[Item] = []
     for row in rows:
@@ -245,24 +266,29 @@ def load_rss_items(db_path: Path, target_date: str) -> list[Item]:
     conn = connect_if_exists(db_path)
     if conn is None:
         return []
-    rows = conn.execute(
-        """
-        SELECT
-            r.title,
-            r.feed_id,
-            COALESCE(f.name, r.feed_id) AS source_name,
-            r.url,
-            r.published_at,
-            r.summary,
-            r.author,
-            r.first_crawl_time,
-            r.last_crawl_time,
-            r.crawl_count
-        FROM rss_items r
-        LEFT JOIN rss_feeds f ON f.id = r.feed_id
-        """
-    ).fetchall()
-    conn.close()
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                r.title,
+                r.feed_id,
+                COALESCE(f.name, r.feed_id) AS source_name,
+                r.url,
+                r.published_at,
+                r.summary,
+                r.author,
+                r.first_crawl_time,
+                r.last_crawl_time,
+                r.crawl_count
+            FROM rss_items r
+            LEFT JOIN rss_feeds f ON f.id = r.feed_id
+            """
+        ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        print(f"[daily] skip rss database: {db_path} ({exc})", file=sys.stderr)
+        rows = []
+    finally:
+        conn.close()
 
     items: list[Item] = []
     for row in rows:
