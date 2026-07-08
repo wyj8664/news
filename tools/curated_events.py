@@ -782,7 +782,6 @@ def layout(title: str, body: str, active: str = "home") -> str:
         ("daily", "/daily/", "日报"),
         ("timeline", "/timeline/", "热点脉络"),
         ("raw", "/hotlists/", "来源热榜"),
-        ("telegraph", "/telegraph/", "财联社电报"),
     ]
     nav_html = "".join(
         f'<a class="{ "active" if key == active else "" }" href="{href}">{label}</a>'
@@ -863,8 +862,10 @@ def layout(title: str, body: str, active: str = "home") -> str:
     .side-info {{ padding: 16px; }}
     .side h3 {{ margin: 0 0 10px; font-size: 15px; }}
     .source-row {{ display: flex; justify-content: space-between; gap: 10px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px; }}
+    a.source-row {{ color: inherit; }}
     .controls {{ display: flex; gap: 8px; flex-wrap: wrap; }}
     .control-btn {{ border: 1px solid var(--line); background: #fff; color: #42506a; border-radius: 6px; padding: 8px 10px; cursor: pointer; font-weight: 700; }}
+    a.control-btn {{ display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-height: 38px; text-align: center; }}
     .control-btn.active {{ background: #20293a; color: #fff; border-color: #20293a; }}
     .category-page-head {{ display: block; }}
     .category-page-head .controls {{ margin-top: 14px; }}
@@ -1358,6 +1359,7 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
         controls.append(
             f'<button class="control-btn" data-source="{e(source_id)}">{e(source_names[source_id])} <span>{len(by_source[source_id])}</span></button>'
         )
+    controls.append('<a class="control-btn" href="/hotlists/telegraph/">财联社电报 <span>时间流</span></a>')
 
     all_rows = "\n".join(source_item_row(item, idx + 1) for idx, item in enumerate(items))
     sections = [
@@ -1390,6 +1392,7 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
         f'<div class="source-row"><span>{e(source_names[source_id])}</span><strong>{len(by_source[source_id])}</strong></div>'
         for source_id in source_order
     )
+    source_rows += '<a class="source-row" href="/hotlists/telegraph/"><span>财联社电报</span><strong>时间流</strong></a>'
     first_dt = min((item.first_dt for item in items), default=None)
     last_dt = max((item.last_dt for item in items), default=None)
     time_range = f"{first_dt.strftime('%H:%M')} - {last_dt.strftime('%H:%M')}" if first_dt and last_dt else "-"
@@ -1421,7 +1424,7 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
     </div>
     <script>
       const sourceList = document.getElementById('source-list');
-      const sourceButtons = Array.from(document.querySelectorAll('.control-btn'));
+      const sourceButtons = Array.from(document.querySelectorAll('.control-btn[data-source]'));
       function applySource(name) {{
         const sections = Array.from(sourceList.querySelectorAll('.source-section'));
         sections.forEach(section => {{

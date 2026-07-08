@@ -739,7 +739,6 @@ def render_html(
       <a class="active" href="/daily/">日报</a>
       <a href="/timeline/">热点脉络</a>
       <a href="/hotlists/">来源热榜</a>
-      <a href="/telegraph/">财联社电报</a>
     </nav>
   </div>
   <div class="shell">

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a standalone Cailianpress telegraph page."""
+"""Generate a Cailianpress telegraph page under the source hotlists section."""
 
 from __future__ import annotations
 
@@ -247,10 +247,9 @@ def nav_html() -> str:
         ("daily", "/daily/", "日报"),
         ("timeline", "/timeline/", "热点脉络"),
         ("raw", "/hotlists/", "来源热榜"),
-        ("telegraph", "/telegraph/", "财联社电报"),
     ]
     return "".join(
-        f'<a class="{ "active" if key == "telegraph" else "" }" href="{href}">{label}</a>'
+        f'<a class="{ "active" if key == "raw" else "" }" href="{href}">{label}</a>'
         for key, href, label in nav
     )
 
@@ -354,7 +353,7 @@ def render_page(items: list[TelegraphItem], generated_at: datetime, errors: list
     </div>
     <div class="page-head">
       <h1>财联社电报</h1>
-      <div class="sub">{e(latest_date)} · 按财联社发布时间倒序展示，不做热度、主题或平台权重排序。</div>
+      <div class="sub">{e(latest_date)} · 来源热榜 / 财联社电报 · 按财联社发布时间倒序展示，不做热度、主题或平台权重排序。</div>
     </div>
     <div class="summary">
       <div class="summary-cell"><strong>{len(items)}</strong><span>电报条目</span></div>
@@ -370,9 +369,27 @@ def render_page(items: list[TelegraphItem], generated_at: datetime, errors: list
 """
 
 
+def redirect_page(target: str) -> str:
+    escaped = e(target)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="0; url={escaped}">
+  <link rel="canonical" href="{escaped}">
+  <title>跳转到财联社电报</title>
+  <script>location.replace({json.dumps(target, ensure_ascii=False)});</script>
+</head>
+<body>
+  <p><a href="{escaped}">财联社电报已移到来源热榜下，点击打开。</a></p>
+</body>
+</html>
+"""
+
+
 def write_outputs(output_root: Path, items: list[TelegraphItem], errors: list[str]) -> Path:
     generated_at = datetime.now(CHINA_TZ)
-    out_dir = output_root / "telegraph"
+    out_dir = output_root / "hotlists" / "telegraph"
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "generated_at": generated_at.isoformat(timespec="seconds"),
@@ -384,6 +401,10 @@ def write_outputs(output_root: Path, items: list[TelegraphItem], errors: list[st
     (out_dir / "latest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     page_path = out_dir / "index.html"
     page_path.write_text(render_page(items, generated_at, errors), encoding="utf-8")
+    legacy_dir = output_root / "telegraph"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    (legacy_dir / "index.html").write_text(redirect_page("/hotlists/telegraph/"), encoding="utf-8")
+    (legacy_dir / "latest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return page_path
 
 
