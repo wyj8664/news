@@ -5,6 +5,8 @@ services:
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
+      PATH: /app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PYTHONPATH: /app/.venv/lib/python3.12/site-packages
       RUN_MODE: cron
       CRON_SCHEDULE: "*/30 * * * *"
       IMMEDIATE_RUN: "false"
@@ -30,12 +32,14 @@ services:
       - |
         while true; do
           python /workspace/tools/market_quotes.py --output-root /workspace/output --watchlist /workspace/config/market_watchlist.json
+          python /workspace/tools/cls_telegraph.py --output-root /workspace/output --limit 120 --pages 8
           python /workspace/tools/curated_events.py --output-root /workspace/output --lookback-days 7 --home-top 24 --daily-top 50 --skip-daily
           python /workspace/tools/daily_digest.py --output-root /workspace/output --top 50 --all
           i=0
           while [ "$$i" -lt 30 ]; do
             if [ "$$((i % 6))" -eq 0 ]; then
               python /workspace/tools/market_quotes.py --output-root /workspace/output --watchlist /workspace/config/market_watchlist.json
+              python /workspace/tools/cls_telegraph.py --output-root /workspace/output --limit 120 --pages 8
             fi
             if [ -f /workspace/output/curated/index.html ] && ! grep -q "今日领域分类" /workspace/output/index.html 2>/dev/null; then
               cp /workspace/output/curated/index.html /workspace/output/index.html

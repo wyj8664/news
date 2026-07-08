@@ -22,3 +22,6 @@
 
 /hotlists/*
   Cache-Control: no-cache
+
+/telegraph/*
+  Cache-Control: no-cache

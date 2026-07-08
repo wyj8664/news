@@ -782,6 +782,7 @@ def layout(title: str, body: str, active: str = "home") -> str:
         ("daily", "/daily/", "日报"),
         ("timeline", "/timeline/", "热点脉络"),
         ("raw", "/hotlists/", "来源热榜"),
+        ("telegraph", "/telegraph/", "财联社电报"),
     ]
     nav_html = "".join(
         f'<a class="{ "active" if key == active else "" }" href="{href}">{label}</a>'

@@ -84,6 +84,9 @@ jobs:
       - name: Generate market quotes
         run: python3 tools/market_quotes.py --output-root output --watchlist config/market_watchlist.json
 
+      - name: Generate CLS telegraph page
+        run: python3 tools/cls_telegraph.py --output-root output --limit 120 --pages 8
+
       - name: Generate curated pages
         run: python3 tools/curated_events.py --output-root output --lookback-days 7 --home-top 24 --daily-top 50 --skip-daily
 
