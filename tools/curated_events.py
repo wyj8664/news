@@ -1191,6 +1191,9 @@ def layout(title: str, body: str, active: str = "home") -> str:
     .control-btn {{ border: 1px solid var(--line); background: #fff; color: #42506a; border-radius: 6px; padding: 8px 10px; cursor: pointer; font-weight: 700; }}
     a.control-btn {{ display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-height: 38px; text-align: center; }}
     .control-btn.active {{ background: #20293a; color: #fff; border-color: #20293a; }}
+    .control-btn.live-refresh-btn {{ border-color: #176b87; color: #176b87; }}
+    .control-btn.live-refresh-btn.refreshing {{ opacity: .72; cursor: wait; }}
+    .live-refresh-status {{ color: var(--muted); font-size: 12px; line-height: 1.6; min-height: 20px; margin-top: 6px; }}
     .category-page-head {{ display: block; }}
     .category-page-head .controls {{ margin-top: 14px; }}
     .category-controls {{ display: grid; grid-template-columns: repeat(9, minmax(0, 1fr)); gap: 8px; width: 100%; }}
@@ -1660,7 +1663,7 @@ def source_item_row(item: RawItem, rank: int) -> str:
         tags.append(f'<span class="mini-chip">{e(rank_text)}</span>')
     tags.append(f'<span class="mini-chip">{e(metric_text)}</span>')
     return f"""
-    <article class="source-item">
+    <article class="source-item" data-source-id="{e(item.source_id)}">
       <div class="source-rank">#{rank}</div>
       <div>
         <h3>{title_html}</h3>
@@ -1690,6 +1693,8 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
         controls.append(
             f'<button class="control-btn" data-source="{e(source_id)}">{e(source_names[source_id])} <span>{len(by_source[source_id])}</span></button>'
         )
+        if source_id == JIN10_SOURCE_ID:
+            controls.append('<button class="control-btn live-refresh-btn" type="button" id="jin10-refresh">刷新金十 <span>实时</span></button>')
     controls.append('<a class="control-btn" href="/hotlists/telegraph/">财联社电报 <span>时间流</span></a>')
 
     all_rows = "\n".join(source_item_row(item, idx + 1) for idx, item in enumerate(items))
@@ -1698,7 +1703,7 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
         <section class="source-section" data-source-section="all">
           <div class="category-head">
             <h2>全部来源</h2>
-            <span class="category-count">{len(items)} 条热榜条目</span>
+            <span class="category-count" data-source-count="all">{len(items)} 条热榜条目</span>
           </div>
           <div class="source-item-list">{all_rows}</div>
         </section>
@@ -1714,7 +1719,7 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
             <section class="source-section" data-source-section="{e(source_id)}">
               <div class="category-head">
                 <h2>{e(source_names[source_id])}</h2>
-                <span class="category-count">{len(source_items)} 条热榜条目</span>
+                <span class="category-count" data-source-count="{e(source_id)}">{len(source_items)} 条热榜条目</span>
               </div>
               <div class="source-item-list">{rows}</div>
             </section>
@@ -1722,7 +1727,7 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
         )
 
     source_rows = "".join(
-        f'<div class="source-row"><span>{e(source_names[source_id])}</span><strong>{len(by_source[source_id])}</strong></div>'
+        f'<div class="source-row" data-source-row="{e(source_id)}"><span>{e(source_names[source_id])}</span><strong>{len(by_source[source_id])}</strong></div>'
         for source_id in source_order
     )
     source_rows += '<a class="source-row" href="/hotlists/telegraph/"><span>财联社电报</span><strong>时间流</strong></a>'
@@ -1739,6 +1744,7 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
       <div class="controls source-controls" id="source-controls">
         {''.join(controls)}
       </div>
+      <div class="live-refresh-status" id="jin10-refresh-status" aria-live="polite"></div>
     </div>
     <div class="category-summary">
       <div class="summary-cell"><strong>{len(items)}</strong><span>热榜条目</span></div>
@@ -1758,6 +1764,9 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
     <script>
       const sourceList = document.getElementById('source-list');
       const sourceButtons = Array.from(document.querySelectorAll('.control-btn[data-source]'));
+      const jin10SourceId = '{JIN10_SOURCE_ID}';
+      const jin10Refresh = document.getElementById('jin10-refresh');
+      const jin10Status = document.getElementById('jin10-refresh-status');
       function applySource(name) {{
         const sections = Array.from(sourceList.querySelectorAll('.source-section'));
         sections.forEach(section => {{
@@ -1769,6 +1778,93 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
       sourceButtons.forEach(btn => btn.addEventListener('click', () => applySource(btn.dataset.source)));
       const initialSource = localStorage.getItem('newshot-source') || 'all';
       applySource(sourceButtons.some(btn => btn.dataset.source === initialSource) ? initialSource : 'all');
+
+      function escapeHtml(value) {{
+        return String(value ?? '')
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#39;');
+      }}
+
+      function renderJin10Row(item, rank) {{
+        const title = escapeHtml(item.title || '');
+        const url = String(item.url || '');
+        const titleHtml = url
+          ? '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer">' + title + '</a>'
+          : title;
+        const categories = Array.isArray(item.official_categories) ? item.official_categories : [];
+        const labels = Array.isArray(item.labels) ? item.labels : [];
+        const tags = [
+          ...categories.map(label => '<span class="mini-chip hot">' + escapeHtml(label) + '</span>'),
+          ...labels.map(label => '<span class="mini-chip">' + escapeHtml(label) + '</span>'),
+          '<span class="mini-chip">' + escapeHtml(item.metric_label || '按时间倒序') + '</span>'
+        ].join('');
+        return [
+          '<article class="source-item" data-source-id="' + jin10SourceId + '">',
+          '  <div class="source-rank">#' + rank + '</div>',
+          '  <div>',
+          '    <h3>' + titleHtml + '</h3>',
+          '    <div class="source-item-meta">' + escapeHtml(item.source_name || '金十数据') + ' · ' + escapeHtml(item.time_label || '') + '</div>',
+          '    <div class="row-tags">' + tags + '</div>',
+          '  </div>',
+          '</article>'
+        ].join('');
+      }}
+
+      function setSourceCount(sourceId, count) {{
+        const countEl = sourceList.querySelector('[data-source-count="' + sourceId + '"]');
+        if (countEl) countEl.textContent = count + ' 条热榜条目';
+        const buttonCount = document.querySelector('.control-btn[data-source="' + sourceId + '"] span');
+        if (buttonCount) buttonCount.textContent = count;
+        const sideCount = document.querySelector('[data-source-row="' + sourceId + '"] strong');
+        if (sideCount) sideCount.textContent = count;
+      }}
+
+      function replaceJin10Items(items) {{
+        const jin10Section = sourceList.querySelector('[data-source-section="' + jin10SourceId + '"]');
+        const jin10List = jin10Section ? jin10Section.querySelector('.source-item-list') : null;
+        if (jin10List) {{
+          jin10List.innerHTML = items.map((item, index) => renderJin10Row(item, index + 1)).join('');
+          setSourceCount(jin10SourceId, items.length);
+        }}
+
+        const allSection = sourceList.querySelector('[data-source-section="all"]');
+        const allList = allSection ? allSection.querySelector('.source-item-list') : null;
+        if (allList) {{
+          const oldRows = Array.from(allList.querySelectorAll('[data-source-id="' + jin10SourceId + '"]'));
+          oldRows.forEach(row => row.remove());
+          const offset = allList.querySelectorAll('.source-item').length;
+          allList.insertAdjacentHTML('beforeend', items.map((item, index) => renderJin10Row(item, offset + index + 1)).join(''));
+          setSourceCount('all', offset + items.length);
+        }}
+      }}
+
+      async function refreshJin10() {{
+        if (!jin10Refresh) return;
+        jin10Refresh.disabled = true;
+        jin10Refresh.classList.add('refreshing');
+        if (jin10Status) jin10Status.textContent = '金十刷新中...';
+        try {{
+          const response = await fetch('/api/jin10/flash?refresh=1&limit=80&ts=' + Date.now(), {{ cache: 'no-store' }});
+          if (!response.ok) throw new Error('HTTP ' + response.status);
+          const payload = await response.json();
+          if (!payload.ok) throw new Error(payload.error || '刷新失败');
+          const items = Array.isArray(payload.items) ? payload.items : [];
+          replaceJin10Items(items);
+          const latest = items[0] && items[0].time ? items[0].time.slice(11, 16) : '--';
+          if (jin10Status) jin10Status.textContent = '金十已更新至 ' + latest + '，共 ' + items.length + ' 条';
+          applySource(jin10SourceId);
+        }} catch (error) {{
+          if (jin10Status) jin10Status.textContent = '金十刷新失败：' + (error.message || String(error));
+        }} finally {{
+          jin10Refresh.disabled = false;
+          jin10Refresh.classList.remove('refreshing');
+        }}
+      }}
+
+      if (jin10Refresh) jin10Refresh.addEventListener('click', refreshJin10);
     </script>
     """
     page = layout("来源热榜", body, "raw")

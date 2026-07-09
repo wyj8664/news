@@ -94,7 +94,9 @@ jobs:
         run: python3 tools/daily_digest.py --output-root output --top 50 --all
 
       - name: Add Cloudflare Pages headers
-        run: cp cloudflare/pages/_headers output/_headers
+        run: |
+          cp cloudflare/pages/_headers output/_headers
+          cp cloudflare/pages/_worker.js output/_worker.js
 
       - name: Save generated history cache
         if: always()
