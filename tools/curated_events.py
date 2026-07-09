@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import math
 import re
 import shutil
 import sqlite3
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -21,6 +24,7 @@ SOURCE_PROFILES = {
     "ifeng": ("权威媒体", "综合新闻", 12, 72),
     "wallstreetcn-hot": ("财经专业源", "财经市场", 17, 84),
     "cls-hot": ("财经专业源", "财经市场", 16, 82),
+    "jin10-flash": ("财经专业源", "快讯", 15, 78),
     "sina-finance": ("财经专业源", "财经市场", 14, 76),
     "xueqiu-hotstock": ("市场热榜", "财经市场", 9, 62),
     "baidu": ("综合热榜", "综合热榜", 10, 58),
@@ -68,8 +72,24 @@ CATEGORY_LABELS = {
 SOURCE_CATEGORY_HINTS = {
     "wallstreetcn-hot": "finance",
     "cls-hot": "finance",
+    "jin10-flash": "finance",
     "sina-finance": "finance",
     "xueqiu-hotstock": "finance",
+}
+
+JIN10_SOURCE_ID = "jin10-flash"
+JIN10_SOURCE_NAME = "金十数据"
+JIN10_BASE_URL = "https://www.jin10.com/"
+JIN10_FLASH_API = "https://flash-api.jin10.com/get_flash_list"
+JIN10_HOT_API = "https://3318fc142ea545eab931e22a61ec6e5c.z3c.jin10.com/flash"
+JIN10_CHANNELS = (1, 5, 9)
+JIN10_HOT_LABELS = ("爆", "沸", "热", "火")
+JIN10_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; NEWSHOT Jin10)",
+    "Accept": "application/json, text/plain, */*",
+    "Origin": JIN10_BASE_URL.rstrip("/"),
+    "Referer": JIN10_BASE_URL,
+    "x-app-id": "bVBF4FyRTn5NJF5n",
 }
 
 CATEGORY_RULES = {
@@ -197,6 +217,9 @@ class RawItem:
     worst_rank: int | None = None
     summary: str = ""
     score: float = 0.0
+    labels: list[str] = field(default_factory=list)
+    rank_label: str = ""
+    metric_label: str = ""
 
 
 @dataclass
@@ -251,7 +274,7 @@ class Event:
 
 
 def clean_text(value: str) -> str:
-    value = html.unescape(value or "")
+    value = html.unescape("" if value is None else str(value))
     value = re.sub(r"<[^>]+>", "", value)
     value = re.sub(r"\s+", " ", value)
     return value.strip()
@@ -531,6 +554,209 @@ def load_rss_items(output_root: Path, date: str) -> list[RawItem]:
             )
         )
     return items
+
+
+def fetch_remote_json(url: str, headers: dict[str, str], timeout: int = 15) -> dict:
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def jin10_headers(version: str) -> dict[str, str]:
+    return {**JIN10_HEADERS, "x-version": version}
+
+
+def fetch_jin10_normal_flash_pages(pages: int = 4) -> list[dict]:
+    items: list[dict] = []
+    max_time = ""
+    for _ in range(max(1, pages)):
+        params: list[tuple[str, object]] = [("channel[]", channel) for channel in JIN10_CHANNELS]
+        if max_time:
+            params.append(("max_time", max_time))
+        url = f"{JIN10_FLASH_API}?{urllib.parse.urlencode(params)}"
+        payload = fetch_remote_json(url, jin10_headers("1.0.0"))
+        page_items = payload.get("data") or []
+        if not isinstance(page_items, list) or not page_items:
+            break
+        dict_items = [item for item in page_items if isinstance(item, dict)]
+        items.extend(dict_items)
+        next_max_time = str(dict_items[-1].get("time") or "") if dict_items else ""
+        if not next_max_time or next_max_time == max_time:
+            break
+        max_time = next_max_time
+    return items
+
+
+def fetch_jin10_hot_flash_items() -> list[dict]:
+    params = {
+        "hot": list(JIN10_HOT_LABELS),
+        "channel": list(JIN10_CHANNELS),
+    }
+    encoded = urllib.parse.quote(json.dumps(params, ensure_ascii=False, separators=(",", ":")))
+    payload = fetch_remote_json(f"{JIN10_HOT_API}?params={encoded}", jin10_headers("1.0"))
+    items = payload.get("data") or []
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def is_jin10_important(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) == 1
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def merge_jin10_raw(existing: dict, incoming: dict) -> dict:
+    merged = dict(existing)
+    merged.update(incoming)
+    if is_jin10_important(existing.get("important")) or is_jin10_important(incoming.get("important")):
+        merged["important"] = 1
+    if not merged.get("hot") and existing.get("hot"):
+        merged["hot"] = existing.get("hot")
+    return merged
+
+
+def jin10_data_title(raw: dict) -> str:
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    title = clean_text(data.get("title") or raw.get("title") or "")
+    if title:
+        return title
+    content = clean_text(data.get("content") or "")
+    if content:
+        match = re.match(r"^【([^】]{2,120})】", content)
+        if match:
+            return clean_text(match.group(1))
+        if len(content) > 120:
+            return content[:120].rstrip() + "..."
+        return content
+
+    if raw.get("type") == 1:
+        subject = "".join(
+            part
+            for part in (
+                clean_text(data.get("country") or ""),
+                clean_text(data.get("time_period") or ""),
+                clean_text(data.get("name") or ""),
+            )
+            if part
+        )
+        stats = []
+        previous = clean_text(data.get("previous") or "")
+        consensus = clean_text(data.get("consensus") or "")
+        actual = clean_text(data.get("actual") or "")
+        if previous:
+            stats.append(f"前值 {previous}")
+        if consensus:
+            stats.append(f"预期 {consensus}")
+        if actual:
+            stats.append(f"公布 {actual}")
+        if subject and stats:
+            return f"{subject}：" + "，".join(stats)
+        if subject:
+            return subject
+
+    return ""
+
+
+def jin10_item_url(raw: dict) -> str:
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    direct = clean_text(data.get("source_link") or data.get("link") or "")
+    if direct.startswith(("http://", "https://")):
+        return direct
+    for remark in raw.get("remark") or []:
+        if not isinstance(remark, dict):
+            continue
+        link = clean_text(remark.get("link") or "")
+        if link.startswith(("http://", "https://")):
+            return link
+    return JIN10_BASE_URL
+
+
+def parse_jin10_dt(value: object) -> datetime | None:
+    raw = str(value or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def normalize_jin10_item(raw: dict) -> RawItem | None:
+    title = jin10_data_title(raw)
+    dt = parse_jin10_dt(raw.get("time"))
+    if not title or dt is None:
+        return None
+
+    hot_label = clean_text(raw.get("hot") or "")
+    if hot_label not in JIN10_HOT_LABELS:
+        hot_label = ""
+    important = is_jin10_important(raw.get("important"))
+    if not important and not hot_label:
+        return None
+
+    labels = []
+    if hot_label:
+        labels.append(hot_label)
+    if important:
+        labels.append("重要")
+
+    tier, source_type, source_weight, source_trust = profile_for(JIN10_SOURCE_ID, JIN10_SOURCE_NAME)
+    if hot_label and important:
+        rank_label = f"{hot_label} · 重要"
+    elif hot_label:
+        rank_label = f"热度 {hot_label}"
+    else:
+        rank_label = "重要快讯"
+
+    return RawItem(
+        date=dt.strftime("%Y-%m-%d"),
+        title=title,
+        url=jin10_item_url(raw),
+        source_id=JIN10_SOURCE_ID,
+        source_name=JIN10_SOURCE_NAME,
+        source_tier=tier,
+        source_type=source_type,
+        source_weight=source_weight,
+        source_trust=source_trust,
+        kind="jin10",
+        first_dt=dt,
+        last_dt=dt,
+        count=1,
+        score=0.0,
+        labels=labels,
+        rank_label=rank_label,
+        metric_label="按时间倒序",
+    )
+
+
+def load_jin10_items(latest_date: str, limit: int = 80) -> list[RawItem]:
+    raw_by_id: dict[str, dict] = {}
+    try:
+        for raw in fetch_jin10_normal_flash_pages():
+            if not is_jin10_important(raw.get("important")):
+                continue
+            key = str(raw.get("id") or normalize_title(jin10_data_title(raw)))
+            if key:
+                raw_by_id[key] = merge_jin10_raw(raw_by_id.get(key, {}), raw)
+    except Exception as exc:
+        print(f"[jin10] normal flash fetch failed: {exc}")
+
+    try:
+        for raw in fetch_jin10_hot_flash_items():
+            key = str(raw.get("id") or normalize_title(jin10_data_title(raw)))
+            if key:
+                raw_by_id[key] = merge_jin10_raw(raw_by_id.get(key, {}), raw)
+    except Exception as exc:
+        print(f"[jin10] hot flash fetch failed: {exc}")
+
+    items = []
+    for raw in raw_by_id.values():
+        item = normalize_jin10_item(raw)
+        if item and item.date == latest_date:
+            items.append(item)
+    items = sorted(items, key=lambda item: item.last_dt, reverse=True)
+    return items[:limit]
 
 
 def load_items(output_root: Path, dates: list[str]) -> list[RawItem]:
@@ -1321,17 +1547,17 @@ def source_item_row(item: RawItem, rank: int) -> str:
     category = primary_category_for_text(item.title)
     if category == "general":
         category = SOURCE_CATEGORY_HINTS.get(item.source_id, "general")
-    rank_text = f"热榜第 {item.best_rank}" if item.best_rank else "RSS"
+    rank_text = item.rank_label or (f"热榜第 {item.best_rank}" if item.best_rank else "RSS")
+    metric_text = item.metric_label or f"{item.count} 次"
     time_span = f"{item.first_dt.strftime('%H:%M')} - {item.last_dt.strftime('%H:%M')}"
     tags = []
     if category != "general":
         tags.append(f'<span class="mini-chip hot">{e(category_label(category))}</span>')
-    tags.extend(
-        [
-            f'<span class="mini-chip">{e(rank_text)}</span>',
-            f'<span class="mini-chip">{item.count} 次</span>',
-        ]
-    )
+    if item.labels:
+        tags.extend(f'<span class="mini-chip">{e(label)}</span>' for label in item.labels)
+    else:
+        tags.append(f'<span class="mini-chip">{e(rank_text)}</span>')
+    tags.append(f'<span class="mini-chip">{e(metric_text)}</span>')
     return f"""
     <article class="source-item">
       <div class="source-rank">#{rank}</div>
@@ -1345,13 +1571,17 @@ def source_item_row(item: RawItem, rank: int) -> str:
 
 
 def render_source_hotlists(output_root: Path, latest_date: str) -> None:
-    items = [item for item in load_hotlist_items(output_root, latest_date) if item.title]
-    items = sorted(items, key=lambda item: (item.score, item.count, item.last_dt), reverse=True)
+    base_items = [item for item in load_hotlist_items(output_root, latest_date) if item.title]
+    base_items = sorted(base_items, key=lambda item: (item.score, item.count, item.last_dt), reverse=True)
+    jin10_items = load_jin10_items(latest_date)
+    items = base_items + jin10_items
     by_source: dict[str, list[RawItem]] = {}
     source_names: dict[str, str] = {}
     for item in items:
         by_source.setdefault(item.source_id, []).append(item)
         source_names[item.source_id] = item.source_name
+    if JIN10_SOURCE_ID in by_source:
+        by_source[JIN10_SOURCE_ID] = sorted(by_source[JIN10_SOURCE_ID], key=lambda item: item.last_dt, reverse=True)
 
     source_order = sorted(by_source, key=lambda source_id: (-len(by_source[source_id]), source_names[source_id]))
     controls = [f'<button class="control-btn active" data-source="all">全部 <span>{len(items)}</span></button>']
@@ -1375,6 +1605,8 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
     ]
     for source_id in source_order:
         source_items = by_source[source_id]
+        if source_id == JIN10_SOURCE_ID:
+            source_items = sorted(source_items, key=lambda item: item.last_dt, reverse=True)
         rows = "\n".join(source_item_row(item, idx + 1) for idx, item in enumerate(source_items))
         sections.append(
             f"""
