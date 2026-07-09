@@ -80,8 +80,8 @@ SOURCE_CATEGORY_HINTS = {
 JIN10_SOURCE_ID = "jin10-flash"
 JIN10_SOURCE_NAME = "金十数据"
 JIN10_BASE_URL = "https://www.jin10.com/"
-JIN10_FLASH_API = "https://flash-api.jin10.com/get_flash_list"
 JIN10_HOT_API = "https://3318fc142ea545eab931e22a61ec6e5c.z3c.jin10.com/flash"
+JIN10_CLASSIFY_API = "https://4a735ea38f8146198dc205d2e2d1bd28.z3c.jin10.com/classify"
 JIN10_CHANNELS = (1, 5, 9)
 JIN10_HOT_LABELS = ("爆", "沸", "热", "火")
 JIN10_HEADERS = {
@@ -218,6 +218,7 @@ class RawItem:
     summary: str = ""
     score: float = 0.0
     labels: list[str] = field(default_factory=list)
+    official_categories: list[str] = field(default_factory=list)
     rank_label: str = ""
     metric_label: str = ""
 
@@ -570,11 +571,11 @@ def fetch_jin10_normal_flash_pages(pages: int = 4) -> list[dict]:
     items: list[dict] = []
     max_time = ""
     for _ in range(max(1, pages)):
-        params: list[tuple[str, object]] = [("channel[]", channel) for channel in JIN10_CHANNELS]
+        params: dict[str, object] = {"channel": list(JIN10_CHANNELS)}
         if max_time:
-            params.append(("max_time", max_time))
-        url = f"{JIN10_FLASH_API}?{urllib.parse.urlencode(params)}"
-        payload = fetch_remote_json(url, jin10_headers("1.0.0"))
+            params["max_time"] = max_time
+        encoded = urllib.parse.quote(json.dumps(params, ensure_ascii=False, separators=(",", ":")))
+        payload = fetch_remote_json(f"{JIN10_HOT_API}?params={encoded}", jin10_headers("1.0"))
         page_items = payload.get("data") or []
         if not isinstance(page_items, list) or not page_items:
             break
@@ -596,6 +597,53 @@ def fetch_jin10_hot_flash_items() -> list[dict]:
     payload = fetch_remote_json(f"{JIN10_HOT_API}?params={encoded}", jin10_headers("1.0"))
     items = payload.get("data") or []
     return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def fetch_jin10_classify_map() -> dict[int, tuple[str, str | None]]:
+    payload = fetch_remote_json(JIN10_CLASSIFY_API, jin10_headers("1.0"))
+    categories = payload.get("data") or []
+    classify_map: dict[int, tuple[str, str | None]] = {}
+    if not isinstance(categories, list):
+        return classify_map
+    for top in categories:
+        if not isinstance(top, dict):
+            continue
+        try:
+            top_id = int(top.get("id"))
+        except (TypeError, ValueError):
+            continue
+        top_name = clean_text(top.get("name"))
+        if not top_name:
+            continue
+        classify_map[top_id] = (top_name, None)
+        for child in top.get("child") or []:
+            if not isinstance(child, dict):
+                continue
+            try:
+                child_id = int(child.get("id"))
+            except (TypeError, ValueError):
+                continue
+            child_name = clean_text(child.get("name"))
+            if child_name:
+                classify_map[child_id] = (child_name, top_name)
+    return classify_map
+
+
+def jin10_official_categories(raw: dict, classify_map: dict[int, tuple[str, str | None]]) -> list[str]:
+    labels: list[str] = []
+    for raw_id in raw.get("classify") or []:
+        try:
+            classify_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        match = classify_map.get(classify_id)
+        if not match:
+            continue
+        name, parent_name = match
+        label = parent_name or name
+        if label and label not in labels:
+            labels.append(label)
+    return labels[:4]
 
 
 def is_jin10_important(value: object) -> bool:
@@ -682,7 +730,7 @@ def parse_jin10_dt(value: object) -> datetime | None:
     return None
 
 
-def normalize_jin10_item(raw: dict) -> RawItem | None:
+def normalize_jin10_item(raw: dict, classify_map: dict[int, tuple[str, str | None]]) -> RawItem | None:
     title = jin10_data_title(raw)
     dt = parse_jin10_dt(raw.get("time"))
     if not title or dt is None:
@@ -725,6 +773,7 @@ def normalize_jin10_item(raw: dict) -> RawItem | None:
         count=1,
         score=0.0,
         labels=labels,
+        official_categories=jin10_official_categories(raw, classify_map),
         rank_label=rank_label,
         metric_label="按时间倒序",
     )
@@ -732,6 +781,12 @@ def normalize_jin10_item(raw: dict) -> RawItem | None:
 
 def load_jin10_items(latest_date: str, limit: int = 80) -> list[RawItem]:
     raw_by_id: dict[str, dict] = {}
+    classify_map: dict[int, tuple[str, str | None]] = {}
+    try:
+        classify_map = fetch_jin10_classify_map()
+    except Exception as exc:
+        print(f"[jin10] classify fetch failed: {exc}")
+
     try:
         for raw in fetch_jin10_normal_flash_pages():
             if not is_jin10_important(raw.get("important")):
@@ -752,7 +807,7 @@ def load_jin10_items(latest_date: str, limit: int = 80) -> list[RawItem]:
 
     items = []
     for raw in raw_by_id.values():
-        item = normalize_jin10_item(raw)
+        item = normalize_jin10_item(raw, classify_map)
         if item and item.date == latest_date:
             items.append(item)
     items = sorted(items, key=lambda item: item.last_dt, reverse=True)
@@ -1544,15 +1599,18 @@ def archive_entries(events: list[Event], dates: list[str]) -> list[tuple[str, st
 def source_item_row(item: RawItem, rank: int) -> str:
     title = e(item.title)
     title_html = f'<a href="{e(item.url)}" target="_blank" rel="noopener noreferrer">{title}</a>' if item.url else title
-    category = primary_category_for_text(item.title)
-    if category == "general":
-        category = SOURCE_CATEGORY_HINTS.get(item.source_id, "general")
     rank_text = item.rank_label or (f"热榜第 {item.best_rank}" if item.best_rank else "RSS")
     metric_text = item.metric_label or f"{item.count} 次"
     time_span = f"{item.first_dt.strftime('%H:%M')} - {item.last_dt.strftime('%H:%M')}"
     tags = []
-    if category != "general":
-        tags.append(f'<span class="mini-chip hot">{e(category_label(category))}</span>')
+    if item.official_categories:
+        tags.extend(f'<span class="mini-chip hot">{e(label)}</span>' for label in item.official_categories)
+    elif item.source_id != JIN10_SOURCE_ID:
+        category = primary_category_for_text(item.title)
+        if category == "general":
+            category = SOURCE_CATEGORY_HINTS.get(item.source_id, "general")
+        if category != "general":
+            tags.append(f'<span class="mini-chip hot">{e(category_label(category))}</span>')
     if item.labels:
         tags.extend(f'<span class="mini-chip">{e(label)}</span>' for label in item.labels)
     else:
