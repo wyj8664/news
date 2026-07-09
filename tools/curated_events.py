@@ -84,6 +84,23 @@ JIN10_HOT_API = "https://3318fc142ea545eab931e22a61ec6e5c.z3c.jin10.com/flash"
 JIN10_CLASSIFY_API = "https://4a735ea38f8146198dc205d2e2d1bd28.z3c.jin10.com/classify"
 JIN10_CHANNELS = (1, 5, 9)
 JIN10_HOT_LABELS = ("爆", "沸", "热", "火")
+JIN10_GEO_TERMS = (
+    "德黑兰",
+    "伊朗",
+    "以色列",
+    "霍尔木兹",
+    "红海",
+    "哈马斯",
+    "胡塞",
+    "袭击",
+    "空袭",
+    "导弹",
+    "军事行动",
+    "商船",
+    "停火",
+    "美伊",
+)
+JIN10_GEO_NOISE_CATEGORIES = {"A股", "美股", "港股", "政策"}
 JIN10_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; NEWSHOT Jin10)",
     "Accept": "application/json, text/plain, */*",
@@ -629,6 +646,25 @@ def fetch_jin10_classify_map() -> dict[int, tuple[str, str | None]]:
     return classify_map
 
 
+def jin10_category_text(raw: dict) -> str:
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    parts = (
+        data.get("title") or raw.get("title") or "",
+        data.get("content") or "",
+    )
+    return " ".join(part for part in (clean_text(value) for value in parts) if part)
+
+
+def is_jin10_geopolitical(raw: dict) -> bool:
+    text = jin10_category_text(raw)
+    if "地缘" in text:
+        return True
+    hits = term_hits(text, JIN10_GEO_TERMS)
+    conflict_hits = term_hits(text, ("袭击", "空袭", "导弹", "军事行动", "商船", "停火"))
+    actor_hits = term_hits(text, ("德黑兰", "伊朗", "以色列", "霍尔木兹", "红海", "哈马斯", "胡塞", "美伊"))
+    return len(hits) >= 2 or (bool(actor_hits) and bool(conflict_hits))
+
+
 def jin10_official_categories(raw: dict, classify_map: dict[int, tuple[str, str | None]]) -> list[str]:
     labels: list[str] = []
     for raw_id in raw.get("classify") or []:
@@ -643,6 +679,13 @@ def jin10_official_categories(raw: dict, classify_map: dict[int, tuple[str, str 
         label = parent_name or name
         if label and label not in labels:
             labels.append(label)
+    if is_jin10_geopolitical(raw):
+        cleaned = [
+            label
+            for label in labels
+            if label != "地缘局势" and label not in JIN10_GEO_NOISE_CATEGORIES
+        ]
+        labels = ["地缘局势", *cleaned]
     return labels[:4]
 
 
