@@ -90,8 +90,8 @@ jobs:
       - name: Generate curated pages
         run: python3 tools/curated_events.py --output-root output --lookback-days 7 --home-top 24 --daily-top 50 --skip-daily
 
-      - name: Generate daily pages
-        run: python3 tools/daily_digest.py --output-root output --top 50 --all
+      - name: Generate daily paused page
+        run: python3 tools/daily_pause.py --output-root output
 
       - name: Add Cloudflare Pages headers
         run: |
