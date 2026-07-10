@@ -1,36 +1,51 @@
 # 编辑选题供稿系统方案
 
+更新时间：2026-07-10
+
+本文是新开对话时最重要的项目上下文：它记录了本轮讨论后确定的 NEWSHOT 编辑供稿方向。`/hotlists/` 继续作为来源看板；最终给群里复制粘贴的产物应该是 `/briefing/latest.md`。
+
 ## 1. 目标
 
 每天固定在 `07:00`、`10:00`、`13:00`、`16:00` 生成一份供编辑选题用的热点清单。
 
-理想输出形态：
+最终输出就是一份 Markdown 文本，直接复制到群里即可。
 
-```text
-2026-07-09 10:00 选题池
+推荐输出形态：
 
-AI / 科技
-1. 标题 - 链接
-2. 标题 - 链接
+```markdown
+# 2026-07-09 10:00 编辑选题池
+
+窗口：07:00-10:00；每赛道最多 20 条；已过滤本日已发送进展。
+
+## AI / 科技
+
+1. [某公司发布新一代大模型，支持多模态实时交互](https://example.com/a)
+2. [英伟达新芯片供应链消息发酵，相关公司回应](https://example.com/b)
 ...
-20. 标题 - 链接
+20. [标题](https://example.com)
 
-财经 / 市场
-1. 标题 - 链接
+## 财经 / 市场
+
+1. [A股三大指数午后回落，半导体板块逆势走强](https://example.com/c)
 ...
-20. 标题 - 链接
+20. [标题](https://example.com)
 
-消费 / 公司
+## 消费 / 公司
+
+1. [某茶饮品牌回应加盟商调整，门店扩张节奏放缓](https://example.com/d)
 ...
 ```
 
 核心要求：
 
 - 每个赛道给 `20` 条。
-- 一条标题对应一个链接。
+- 每条只保留 `标题 + 链接`，不输出复杂解释、打分和调试字段。
+- 群里优先使用 Markdown 链接格式：`1. [标题](链接)`。
+- 如果群工具不支持 Markdown，可以降级为：`1. 标题 - 链接`。
 - 尽量是当前时间段的新内容，而不是早上已经看过、下午还排在最前的旧内容。
-- 同一件事不要重复出现。
-- 已经发给群里的内容，后续批次默认不再重复发。
+- 同一事实不要重复出现。
+- 同一事件有新进展时，可以再次出现，但必须输出新的 progress。
+- 已经发给群里的 progress，后续批次默认不再重复发。
 - `/hotlists/` 可以继续作为来源看板，但不再承担最终编辑供稿排序。
 
 ## 2. 当前情况
@@ -66,11 +81,11 @@ TrendRadar 抓热榜
 → 生成行情
 → 生成财联社电报页
 → 生成 curated / hotlists 页面
-→ 生成日报
+→ 生成 /daily/ 停更占位页
 → 部署到 Cloudflare Pages
 ```
 
-完整流程经常需要 15 分钟左右。因此，其他热榜并不是实时的。
+长内容日报已经暂时停更，所以部署耗时明显缩短。但除金十实时按钮外，其他热榜仍然不是前端实时抓取，仍依赖定时任务生成静态页面。
 
 ### 2.3 金十数据
 
@@ -96,7 +111,16 @@ important=1 或 爆 / 沸 / 热 / 火
 http://127.0.0.1:8001/
 ```
 
-它的作用更接近“人工分类 / 赛道归类”。问题是：如果排序只看已有热度或分类结果，没有时间窗口和已发送历史，就会出现较早新闻排在靠前位置的情况。
+它现在已经有几项很重要的能力：
+
+- 按公众号文章做赛道分类。
+- 对早报、晨报、盘前必读、8点1氪、邦早报等合集标题做拆条。
+- 在每个赛道内做事件聚合。
+- 每个赛道输出 Top N。
+
+它可以作为编辑供稿系统的“行业内容主干来源”，但不建议成为唯一来源。金十、财联社电报负责实时进展，微博、抖音、头条、百度等负责大众热度，公众号分类站负责赛道语义和行业内容。
+
+当前问题是：如果排序只看已有热度或分类结果，没有批次时间窗口、progress 去重和已发送历史，就会出现较早新闻排在靠前位置的情况。
 
 ### 2.5 当前系统的主要问题
 
@@ -105,7 +129,8 @@ http://127.0.0.1:8001/
 3. tab 切换不等于刷新。
 4. 排序没有严格按供稿时间窗口控制。
 5. 缺少“已发历史”，旧内容会反复出现。
-6. 分类网站可以辅助赛道判断，但不应该直接决定最终排序。
+6. 缺少 event-progress 两级去重，新进展和重复旧事实容易混在一起。
+7. 公众号分类网站可以作为赛道主干来源，但不应该单独决定最终排序。
 
 ## 3. 先召回还是先聚类
 
@@ -116,11 +141,14 @@ http://127.0.0.1:8001/
 ```text
 来源采集
 → 标准化
+→ 早报 / 合集 / 长标题拆成 atomic item
 → 大召回
 → 初步分类
-→ 去重 / 聚类
-→ 聚类级排序
+→ 聚类成 event
+→ event 内识别 progress
+→ progress 级排序
 → 每个赛道取 20 条
+→ 生成可复制 Markdown
 → 记录已发送历史
 ```
 
@@ -168,12 +196,14 @@ http://127.0.0.1:8001/
 ```text
 源站内容
 → 来源召回
-→ 标准化 item
+→ 标准化 raw_doc
+→ 早报 / 合集拆成 atomic_item
 → 编辑候选召回
-→ 聚类为 event / topic
+→ 聚类为 event
+→ event 内切 progress
 → 赛道分类
 → 排序
-→ 输出
+→ 输出 Markdown
 ```
 
 ## 4. 来源层
@@ -240,36 +270,155 @@ http://127.0.0.1:8001/
 目标：
 
 ```text
-供分类和人工校正，不直接决定最终热度排序
+提供行业内容主干、赛道语义和人工校正；最终排序仍由统一供稿系统计算
 ```
 
-## 5. 标准化层
+## 5. 标准化 / 原子化层
 
-每个来源拿到的数据格式不同，必须先统一成同一种 item。
+每个来源拿到的数据格式不同，必须先统一。这里不要只建一个 `item` 概念，建议拆成四层：
+
+```text
+raw_doc 原始文档
+  ↓ 一对多
+atomic_item 原子新闻点
+  ↓ 多对一
+event 事件
+  ↓ 一对多
+progress 进展
+```
+
+### 5.1 raw_doc：原始文档
+
+`raw_doc` 表示源站里看到的一条原始内容。
+
+例子：
+
+- 一条微博热搜。
+- 一条金十快讯。
+- 一条财联社电报。
+- 一篇公众号文章。
+- 一篇早报 / 晨报 / 盘前必读合集。
 
 推荐字段：
 
 ```text
-id                  内部唯一 id
-source_id           来源 id，例如 weibo / toutiao / jin10
+raw_doc_id          原始文档 id
+source_id           来源 id，例如 weibo / toutiao / jin10 / wechat
 source_name         来源名称
-title               标题
-url                 链接
-raw_url             原始链接，如果和展示链接不同
-summary             摘要，可为空
+title               原始标题
+url                 原始链接
+summary             原始摘要，可为空
 rank                来源内排名，可为空
 hot_value           热度值，可为空
 source_labels       来源标签，例如 important、火、热
 official_category   来源官方分类，例如金十的 A股、美股、地缘局势
-first_seen_at       第一次看到时间
-last_seen_at        最近一次看到时间
 published_at        内容发布时间，如果源站提供
-fetched_at          抓取时间
-content_hash        标题归一化后的 hash
+first_seen_at       第一次抓到这个 raw_doc 的时间
+last_seen_at        最近一次还看到这个 raw_doc 的时间
+fetched_at          本次抓取时间
 raw_payload         原始数据 JSON
 ```
 
-这一步只做“格式统一”，不做最终取舍。
+### 5.2 atomic_item：原子新闻点
+
+`atomic_item` 才是后续召回、分类、聚类的基本单位。
+
+普通内容通常是：
+
+```text
+1 个 raw_doc → 1 个 atomic_item
+```
+
+但早报、合集、长标题、市场快讯可能是：
+
+```text
+1 个 raw_doc → 多个 atomic_item
+```
+
+例如：
+
+```text
+raw_doc:
+【早报】美股科技股大反弹；某公司新车发布；原油大涨
+
+atomic_item_1:
+美股科技股大反弹
+
+atomic_item_2:
+某公司新车发布
+
+atomic_item_3:
+原油大涨
+```
+
+这会导致同一个原始 URL 多次出现。这个不是 bug，而是说明多个原子新闻点来自同一篇合集。
+
+推荐字段：
+
+```text
+atomic_item_id      原子新闻点 id
+raw_doc_id          所属原始文档 id
+title               原子新闻标题
+url                 对外输出链接，通常等于 raw_doc.url
+original_url        原始文档链接
+split_index         如果来自拆条，这是第几个片段
+is_split_item       是否来自早报 / 合集 / 长标题拆条
+split_source_title  原始合集标题
+summary             原子新闻摘要，可为空
+source_id           来源 id
+source_name         来源名称
+published_at        原始发布时间
+first_seen_at       第一次看到这个 atomic_item 的时间
+last_seen_at        最近一次看到这个 atomic_item 的时间
+normalized_title    归一化标题
+content_hash        normalized_title 的 hash
+```
+
+### 5.3 event：事件
+
+`event` 表示同一件事。
+
+多个来源、多个标题、多个 atomic_item 可以归到同一个 event。
+
+```text
+微博：某公司发布新车
+公众号早报拆条：某公司新车发布
+金十：某公司新车订单突破 X
+
+→ 同一个 event：某公司新车发布与订单进展
+```
+
+### 5.4 progress：事件进展
+
+`progress` 表示同一事件下的某个事实增量。
+
+例如：
+
+```text
+event:
+某公司新车发布
+
+progress_1:
+官方确认发布时间和定位
+
+progress_2:
+价格公布
+
+progress_3:
+订单突破 10 万
+```
+
+去重时不能只看 event。正确规则是：
+
+```text
+同一个 progress 发过：不再发
+同一个 event 但出现新的 progress：可以再次发
+```
+
+这能避免两个问题：
+
+- 同一旧事实换标题反复发。
+- 一个事件有新进展时，因为 event 已发过而被误杀。
 
 ## 6. 召回层
 
@@ -358,23 +507,19 @@ AI、模型、芯片、自动驾驶、低空经济、消费、跨境、电商、
 
 最终第几名应该由排序层决定。
 
-## 7. 聚类 / 去重层
+## 7. 原子化 / 聚类 / 进展去重层
 
-聚类的目标是把同一件事合并成一个事件。
-
-例如：
+这一层分三步：
 
 ```text
-微博：某公司发布新车
-今日头条：某公司新车售价公布
-金十：某公司新车订单突破 X
+raw_doc 原子化为 atomic_item
+→ atomic_item 聚类为 event
+→ event 内识别 progress
 ```
-
-这些可能都属于同一事件，最终给编辑时不应该重复出现三次。
 
 ### 7.1 聚类输入
 
-聚类输入应该是召回后的候选池，而不是全量历史库。
+聚类输入应该是召回后的 `atomic_item` 候选池，而不是全量历史库，也不是原始 `raw_doc`。
 
 原因：
 
@@ -382,12 +527,56 @@ AI、模型、芯片、自动驾驶、低空经济、消费、跨境、电商、
 - 更符合当前批次时间窗口。
 - 计算更轻。
 - 避免旧新闻持续干扰。
+- 早报、合集、市场快讯需要先拆条，否则一篇文章会被误当成一个事件。
 
-### 7.2 聚类方法
+### 7.2 早报 / 合集 / 长标题拆条
 
-可以先用规则，不必一开始就上复杂模型。
+公众号分类网站已经有这条规则，后续供稿系统应该继承。
 
-推荐组合：
+命中以下情况时，先把一个 `raw_doc` 拆成多个 `atomic_item`：
+
+- 标题像早报、晨报、午报、晚报、盘前必读、8点1氪、邦早报、钛晨报、科股快报，并且有分隔符。
+- 来源像每日经济新闻、36氪、创业邦、钛媒体、虎嗅、第一财经，并且标题较长、分隔符较多。
+- 标题分隔符不少于 3 个且长度不少于 48。
+- 标题较长，同时包含多个市场波动词和资产词。
+
+常见分隔符：
+
+```text
+； ; 丨 ｜ |
+```
+
+拆条后：
+
+```text
+raw_doc.url 可以重复
+atomic_item.title 必须不同
+atomic_item_id 必须不同
+```
+
+同一 URL 多次出现是合理的，因为多个原子新闻点可能来自同一篇早报。真正需要限制的是输出密度：
+
+```text
+同一 original_url 在同一赛道最多输出 2 条
+同一 original_url 在同一批次最多输出 3 到 5 条
+```
+
+### 7.3 event 聚类
+
+event 的目标是把同一件事合并。
+
+例如：
+
+```text
+微博：某公司发布新车
+今日头条：某公司新车售价公布
+公众号早报拆条：某公司新车发布
+金十：某公司新车订单突破 X
+```
+
+这些可能属于同一个 event。
+
+event 聚类可以先用规则：
 
 1. 标题归一化
    - 去掉标点。
@@ -396,8 +585,8 @@ AI、模型、芯片、自动驾驶、低空经济、消费、跨境、电商、
    - 去掉来源后缀。
 
 2. URL 去重
-   - 同一 URL 直接认为同一条。
-   - 跳转链接需要尽量取最终链接。
+   - 普通文章同一 URL 可以直接认为同一 raw_doc。
+   - 对 `is_split_item=true` 的拆条内容，不能只按 URL 去重，要用 `original_url + normalized_title` 或 `raw_doc_id + split_index`。
 
 3. 标题相似度
    - 归一化标题完全包含。
@@ -412,38 +601,86 @@ AI、模型、芯片、自动驾驶、低空经济、消费、跨境、电商、
    - 同一事件通常在几小时内集中出现。
    - 时间差太远时，即使标题相似，也要谨慎合并。
 
-### 7.3 聚类输出
-
-聚类后形成 cluster。
-
-推荐字段：
+推荐 event 字段：
 
 ```text
-cluster_id
-title
+event_id
+canonical_title
 representative_url
-items
+atomic_items
 sources
 source_count
 first_seen_at
 last_seen_at
 primary_track
 secondary_tracks
-score
+status
+```
+
+### 7.4 progress 识别
+
+progress 是 event 里的新事实节点。最终供稿应该按 progress 去重，而不是只按 event 去重。
+
+同一 event 下可以有多个 progress：
+
+```text
+event:
+某公司新车发布
+
+progress_1:
+官方确认发布时间和定位
+
+progress_2:
+价格公布
+
+progress_3:
+订单突破 10 万
+```
+
+判断是否是新 progress，可以看：
+
+- 是否出现新动作：发布、定价、上市、回应、辟谣、调查、处罚、停牌、复牌、融资、收购。
+- 是否出现新数字：价格、订单、金额、涨跌幅、伤亡数、投票结果。
+- 是否出现新主体回应：公司回应、监管回应、当事人回应。
+- 是否出现新阶段：传闻、确认、落地、结果、后续影响。
+
+推荐 progress 字段：
+
+```text
+progress_id
+event_id
+progress_title
+progress_summary
+progress_type
+representative_atomic_item_id
+representative_url
+first_seen_at
+last_seen_at
+novelty_score
 sent_status
 ```
 
-### 7.4 代表标题和链接怎么选
+### 7.5 代表标题和链接怎么选
 
-每个 cluster 最终只能输出一条标题和一个链接。
+每个 progress 最终只输出一条标题和一个链接。
 
 代表内容选择规则：
 
-1. 优先选有明确原文链接的。
-2. 优先选标题清楚、信息密度高的。
-3. 优先选权威来源。
-4. 如果是快讯，优先选最新一条。
+1. 优先选标题清楚、信息密度高的 atomic_item。
+2. 优先选有明确原文链接的。
+3. 优先选权威来源和快讯源。
+4. 如果是新进展，优先选能体现增量事实的标题。
 5. 如果是社交热榜，避免只给搜索页，除非没有更好链接。
+
+### 7.6 群里重复的判断标准
+
+最终不是按 URL 去重，也不是按 event 一刀切。
+
+```text
+同一 progress 已经发过：不再发
+同一 event 但新 progress：可以发
+同一 original_url 的不同拆条：可以发，但要限量
+```
 
 ## 8. 分类 / 赛道层
 
@@ -453,21 +690,22 @@ sent_status
 
 ```text
 item 级初步分类
-→ cluster 聚类
-→ cluster 级最终分类
+→ event 聚类
+→ event 级主赛道分类
+→ progress 继承或微调赛道
 ```
 
 item 级分类用于帮助召回和聚类。
 
-cluster 级分类用于最终输出。
+event 级分类用于确定主赛道，progress 可以在必要时微调。例如同一个“某公司新车发布”事件，价格发布可能进汽车，股价异动可能同时影响财经。
 
-### 8.2 为什么要 cluster 级最终分类
+### 8.2 为什么要 event / progress 级最终分类
 
 同一事件可能来自多个来源，每个来源的分类都不完全可靠。
 
 比如金十可能把一条地缘冲突新闻标成美股，因为它影响美股市场。但编辑供稿时，这条更应该进“国际 / 地缘 / 财经市场”中的某个主赛道。
 
-所以最终分类应该基于整个 cluster 判断，而不是只看某一条来源标签。
+所以最终分类应该基于整个 event / progress 判断，而不是只看某一条来源标签。
 
 ### 8.3 赛道建议
 
@@ -548,9 +786,9 @@ final_score =
 | source_score | 来源权重 |
 | cross_source_score | 多来源同时出现加分 |
 | track_match_score | 和赛道越匹配越高 |
-| novelty_score | 新出现事件加分 |
+| novelty_score | 新 progress 加分 |
 | stale_penalty | 超过当前窗口扣分 |
-| duplicate_penalty | 与已有 cluster 重复扣分 |
+| duplicate_penalty | 与已有 progress 重复扣分 |
 | sent_penalty | 已经发过的内容扣分或直接过滤 |
 
 ### 9.3 时间衰减
@@ -582,7 +820,8 @@ final_score =
 
 ```text
 sent_id
-cluster_id
+event_id
+progress_id
 title_hash
 representative_url
 track
@@ -593,19 +832,20 @@ sent_at
 每次生成前检查：
 
 ```text
-同一 cluster 今天发过：不再发
-相似标题今天发过：不再发
-同一 URL 今天发过：不再发
+同一 progress 今天发过：不再发
+同一 event 今天发过但出现新 progress：可以发
+相似标题今天发过且没有新事实：不再发
+同一 URL 今天发过：如果是同一 progress 不再发；如果是合集拆条的不同 progress，可以发但限量
 ```
 
-如果某事件有重大新进展，可以允许再次出现，但标题中必须有新的增量信息。
+如果某事件有重大新进展，可以允许再次出现，但标题中必须有新的增量信息，并生成新的 `progress_id`。
 
 ### 9.5 每赛道 20 条怎么取
 
 推荐流程：
 
 ```text
-1. 每个 cluster 有 primary_track。
+1. 每个 progress 继承或修正 event 的 primary_track。
 2. 按 primary_track 分桶。
 3. 每个桶内按 final_score 排序。
 4. 每个赛道取前 20。
@@ -674,7 +914,8 @@ schedule:
 tools/
   collect_fast_hotlists.py
   editor_briefing.py
-  cluster_items.py
+  cluster_events.py
+  detect_progress.py
   classify_tracks.py
 
 data/
@@ -699,11 +940,15 @@ TrendRadar 原始热榜
 财联社电报
 公众号分类 / 人工补充
         ↓
-标准化 normalized_items
+标准化 raw_docs
+        ↓
+早报 / 合集 / 长标题拆成 atomic_items
         ↓
 按批次时间窗口召回 candidates
         ↓
-聚类 clusters
+聚类 events
+        ↓
+识别 progresses
         ↓
 赛道分类 tracks
         ↓
@@ -711,9 +956,9 @@ TrendRadar 原始热榜
         ↓
 每赛道取 20
         ↓
-生成 Markdown / HTML / JSON
+生成可复制 Markdown
         ↓
-发群或人工复制
+人工复制到群
         ↓
 写入 sent history
 ```
@@ -729,7 +974,7 @@ TrendRadar 原始热榜
 生成行情
 生成电报
 生成来源热榜
-生成日报
+生成 /daily/ 停更占位页
 部署
 ```
 
@@ -788,12 +1033,14 @@ TrendRadar 抓取
 读取最近候选池
 必要时补抓实时源
 召回
-聚类
+早报 / 合集拆条
+聚类 event
+识别 progress
 分类
 排序
-生成 briefing
+生成 briefing Markdown
 写 sent history
-部署或推送群
+部署或人工复制到群
 ```
 
 ### 12.3 长内容日报暂时停更
@@ -822,6 +1069,32 @@ TrendRadar 抓取
 
 你手动复制到群里。
 
+`latest.md` 是第一优先产物，格式要保持简单，避免群里阅读负担：
+
+```markdown
+# 2026-07-09 13:00 编辑选题池
+
+## AI / 科技
+
+1. [标题](链接)
+2. [标题](链接)
+
+## 汽车 / 出行
+
+1. [标题](链接)
+2. [标题](链接)
+```
+
+不要在群版 Markdown 里输出：
+
+- 分数
+- 聚类调试信息
+- 来源明细列表
+- 过长摘要
+- JSON 字段
+
+这些信息可以放在 `/briefing/latest.html` 的调试视图里，但不进群。
+
 稳定后再接：
 
 - 飞书机器人
@@ -845,15 +1118,18 @@ TrendRadar 抓取
 数据来源：
 
 - 现有 TrendRadar output
+- 公众号分类结果作为主干来源
 - 金十实时接口
 - 财联社电报静态结果
-- 公众号分类结果，如果能导出
 
 功能：
 
 - 按批次时间窗口召回。
-- 简单聚类去重。
-- 按赛道分类。
+- 早报 / 合集 / 长标题拆成 atomic_item。
+- 聚类成 event。
+- event 内识别 progress。
+- 按 progress 去重和排序。
+- 按赛道分类，每个 progress 归入一个主赛道。
 - 每赛道输出 20 条。
 - 记录已输出历史。
 
@@ -924,19 +1200,22 @@ TrendRadar 抓取
 ```text
 输入：
   现有 output 热榜数据
+  公众号分类结果
   金十实时数据
   财联社电报数据
 
 处理：
   过去 3 到 6 小时召回
-  标题相似去重
+  早报 / 合集拆条
+  标题相似聚成 event
+  event 内识别 progress
   规则分类到赛道
   freshness + source_rank + source_weight 排序
-  已发过的不再出现
+  已发过的 progress 不再出现
 
 输出：
-  output/briefing/latest.md
-  output/briefing/latest.html
+  output/briefing/latest.md    群复制主产物
+  output/briefing/latest.html  辅助查看页
 ```
 
 这样就能先解决最痛的问题：
@@ -954,17 +1233,20 @@ TrendRadar 抓取
 
 ```text
 来源抓取
+→ 标准化 raw_doc
+→ 拆成 atomic_item
 → 大召回
-→ 聚类去重
+→ 聚类成 event
+→ 识别 progress
 → 赛道分类
 → 时间窗口排序
 → 每赛道 20 条
 → 写入已发历史
-→ 生成 Markdown
+→ 生成可复制 Markdown
 ```
 
-先召回，再聚类。
+先召回，再聚类；但早报、合集、长标题要在聚类前先拆成 atomic_item。
 
 但召回要宽，排序要严。
 
-`/hotlists/` 继续当来源看板；真正给编辑群用的，应该是新的 `/briefing/` 供稿页。
+`/hotlists/` 继续当来源看板；真正给编辑群用的，应该是新的 `/briefing/latest.md`。
