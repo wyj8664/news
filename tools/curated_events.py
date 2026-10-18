@@ -1,22 +1,46 @@
 #!/usr/bin/env python3
-"""Generate curated news events, layered daily reports, and event timelines."""
+"""Generate shared classified events, seven-sector daily reports and source pages."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import math
+import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable
+from zoneinfo import ZoneInfo
+
+from news_freshness import CHINA, WINDOW_HOURS, china_time, parse_publication_time, select_home_items, write_json
+from news_event_clustering import deduplicate_reports, group_event_items, publisher_id, publisher_name, safe_link, ACTION_RULES
+from event_registry import EventRegistry, Progress as HomeProgress, TYPE_LABELS, clean_headline, document_id
+from home_categories import CATEGORY_ORDER as HOME_CATEGORY_ORDER, category_label as home_category_label, classify_event as classify_home_event
+from jin10_public import public_jin10_record
+from jiemian_flash import SOURCE_ID as JIEMIAN_SOURCE_ID, SOURCE_NAME as JIEMIAN_SOURCE_NAME, LIST_URL as JIEMIAN_LIST_URL
+
+DAILY_CATEGORY_ORDER = tuple(key for key in HOME_CATEGORY_ORDER if key != "society")
+
+
+def atomic_text(path: Path, text: str) -> None:
+    """Readers see the old or new page, never a half-written page."""
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        handle.write(text)
+        temporary = Path(handle.name)
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 SOURCE_PROFILES = {
@@ -24,7 +48,9 @@ SOURCE_PROFILES = {
     "ifeng": ("权威媒体", "综合新闻", 12, 72),
     "wallstreetcn-hot": ("财经专业源", "财经市场", 17, 84),
     "cls-hot": ("财经专业源", "财经市场", 16, 82),
+    "cls-telegraph": ("财经专业源", "媒体快讯", 16, 82),
     "jin10-flash": ("财经专业源", "快讯", 15, 78),
+    "jiemian-flash": ("财经专业源", "媒体快报", 16, 82),
     "sina-finance": ("财经专业源", "财经市场", 14, 76),
     "xueqiu-hotstock": ("市场热榜", "财经市场", 9, 62),
     "baidu": ("综合热榜", "综合热榜", 10, 58),
@@ -165,7 +191,6 @@ TRACK_CATEGORIES = {
 }
 
 CATEGORY_ORDER = ("policy", "international", "military", "finance", "tech", "society", "entertainment", "sports", "general")
-VISIBLE_CATEGORY_ORDER = ("policy", "international", "military", "finance", "tech", "society", "entertainment", "sports")
 
 IMPORTANT_TERMS = (
     "国务院", "外交部", "商务部", "央行", "证监会", "财政部", "美国", "特朗普", "关税", "访华",
@@ -238,6 +263,11 @@ class RawItem:
     official_categories: list[str] = field(default_factory=list)
     rank_label: str = ""
     metric_label: str = ""
+    published_dt: datetime | None = None
+    publication_source: str = ""
+    collected_dt: datetime | None = None
+    doc_id: str = ""
+    native_id: str = ""
 
 
 @dataclass
@@ -258,6 +288,7 @@ class Event:
     next_watch: str = ""
     status: str = ""
     trackable: bool = False
+    progresses: list[HomeProgress] = field(default_factory=list)
 
     def add(self, item: RawItem) -> None:
         self.items.append(item)
@@ -515,6 +546,7 @@ def load_hotlist_items(output_root: Path, date: str) -> list[RawItem]:
                 best_rank=best_rank,
                 worst_rank=worst_rank,
                 score=score,
+                collected_dt=last_dt,
             )
         )
     return items
@@ -550,6 +582,7 @@ def load_rss_items(output_root: Path, date: str) -> list[RawItem]:
         count = int(row["crawl_count"] or 1)
         title = clean_text(row["title"])
         first_dt = parse_iso_like(row["published_at"] or "", date, row["first_crawl_time"] or "")
+        published = parse_publication_time(row["published_at"])
         last_dt = parse_time(date, row["last_crawl_time"] or row["first_crawl_time"] or "")
         score = item_score(title, source_weight, count, None, source_trust) + 8
         items.append(
@@ -569,6 +602,9 @@ def load_rss_items(output_root: Path, date: str) -> list[RawItem]:
                 count=count,
                 summary=clean_text(row["summary"] or "")[:180],
                 score=score,
+                published_dt=published.replace(tzinfo=None) if published else None,
+                publication_source="rss:published_at" if published else "",
+                collected_dt=last_dt,
             )
         )
     return items
@@ -774,6 +810,8 @@ def parse_jin10_dt(value: object) -> datetime | None:
 
 
 def normalize_jin10_item(raw: dict, classify_map: dict[int, tuple[str, str | None]]) -> RawItem | None:
+    if not public_jin10_record(raw):
+        return None
     title = jin10_data_title(raw)
     dt = parse_jin10_dt(raw.get("time"))
     if not title or dt is None:
@@ -783,8 +821,6 @@ def normalize_jin10_item(raw: dict, classify_map: dict[int, tuple[str, str | Non
     if hot_label not in JIN10_HOT_LABELS:
         hot_label = ""
     important = is_jin10_important(raw.get("important"))
-    if not important and not hot_label:
-        return None
 
     labels = []
     if hot_label:
@@ -797,8 +833,10 @@ def normalize_jin10_item(raw: dict, classify_map: dict[int, tuple[str, str | Non
         rank_label = f"{hot_label} · 重要"
     elif hot_label:
         rank_label = f"热度 {hot_label}"
-    else:
+    elif important:
         rank_label = "重要快讯"
+    else:
+        rank_label = "普通快讯"
 
     return RawItem(
         date=dt.strftime("%Y-%m-%d"),
@@ -813,7 +851,11 @@ def normalize_jin10_item(raw: dict, classify_map: dict[int, tuple[str, str | Non
         kind="jin10",
         first_dt=dt,
         last_dt=dt,
+        published_dt=dt,
+        publication_source="jin10:time",
+        collected_dt=datetime.now(CHINA).replace(tzinfo=None),
         count=1,
+        summary=clean_text((raw["data"].get("content") if isinstance(raw.get("data"), dict) else "") or raw.get("summary") or "")[:6000],
         score=0.0,
         labels=labels,
         official_categories=jin10_official_categories(raw, classify_map),
@@ -822,7 +864,11 @@ def normalize_jin10_item(raw: dict, classify_map: dict[int, tuple[str, str | Non
     )
 
 
-def load_jin10_items(latest_date: str, limit: int = 80) -> list[RawItem]:
+def load_jin10_items(latest_date: str | None = None, limit: int = 2000) -> list[RawItem]:
+    """Read the newest Jin10 records, independently of the platform DB date.
+
+    latest_date is retained for caller compatibility, not as a date filter.
+    """
     raw_by_id: dict[str, dict] = {}
     classify_map: dict[int, tuple[str, str | None]] = {}
     try:
@@ -832,29 +878,106 @@ def load_jin10_items(latest_date: str, limit: int = 80) -> list[RawItem]:
 
     try:
         for raw in fetch_jin10_normal_flash_pages():
-            if not is_jin10_important(raw.get("important")):
-                continue
             key = str(raw.get("id") or normalize_title(jin10_data_title(raw)))
             if key:
                 raw_by_id[key] = merge_jin10_raw(raw_by_id.get(key, {}), raw)
     except Exception as exc:
         print(f"[jin10] normal flash fetch failed: {exc}")
 
-    try:
-        for raw in fetch_jin10_hot_flash_items():
-            key = str(raw.get("id") or normalize_title(jin10_data_title(raw)))
-            if key:
-                raw_by_id[key] = merge_jin10_raw(raw_by_id.get(key, {}), raw)
-    except Exception as exc:
-        print(f"[jin10] hot flash fetch failed: {exc}")
-
     items = []
     for raw in raw_by_id.values():
         item = normalize_jin10_item(raw, classify_map)
-        if item and item.date == latest_date:
+        if item:
             items.append(item)
     items = sorted(items, key=lambda item: item.last_dt, reverse=True)
     return items[:limit]
+
+
+def load_jin10_source_items(output_root: Path, limit: int = 2000) -> tuple[list[RawItem], dict]:
+    """Read the same public snapshot as the homepage; rendering never re-fetches."""
+    from home_source_pool import read_snapshot
+    snapshot = read_snapshot(output_root / "source-pool" / "jin10-all.json")
+    legacy = bool(snapshot) and snapshot.get("public_only") is not True
+    if legacy:
+        snapshot = {}
+    by_record = {}
+    captured = parse_publication_time(snapshot.get("fetched_at"))
+    observations = snapshot.get("item_observed_at")
+    observations = observations if isinstance(observations, dict) else {}
+    if snapshot:
+        for raw in snapshot.get("items", []):
+            if not isinstance(raw, dict):
+                continue
+            if not public_jin10_record(raw):
+                continue
+            published = parse_publication_time(raw.get("published_at"))
+            if not published:
+                continue
+            reconstructed = {"title": raw.get("title"), "time": published.strftime("%Y-%m-%d %H:%M:%S"),
+                             "important": raw.get("important"), "hot": raw.get("hot"),
+                             "summary": raw.get("summary", ""),
+                             "data": {"source_link": safe_link(str(raw.get("url") or ""))}}
+            item = normalize_jin10_item(reconstructed, {})
+            if item is None:
+                continue
+            observed = parse_publication_time(observations.get(str(raw.get("id")))) or captured
+            item.collected_dt = observed.replace(tzinfo=None) if observed else None
+            categories = raw.get("official_categories")
+            categories = categories if isinstance(categories, list) else []
+            item.official_categories = list(dict.fromkeys([
+                *item.official_categories,
+                *[label for label in categories if isinstance(label, str)],
+            ]))[:4]
+            key = (item.title, item.published_dt)
+            previous = by_record.get(key)
+            if previous is None or (item.collected_dt or datetime.min) > (previous.collected_dt or datetime.min):
+                by_record[key] = item
+    items = sorted(by_record.values(), key=lambda item: item.published_dt, reverse=True)[:limit]
+    return items, {"cached": True, "fetched_at": captured, "legacy_subset": legacy,
+                   "window_complete": snapshot.get("window_complete") is True and len(by_record) <= limit,
+                   "errors": snapshot.get("errors", []), "skipped_restricted": snapshot.get("skipped_restricted", 0)}
+
+
+def load_weibo_items(output_root: Path) -> list[RawItem]:
+    snapshot = output_root / "weibo" / "latest.json"
+    if not snapshot.exists():
+        return []
+    try:
+        payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    allowed = {str(account.get("id", "")) for account in payload.get("accounts", [])}
+    collected = parse_publication_time(payload.get("fetched_at"))
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    cutoff = now.timestamp() * 1000 - 24 * 3600 * 1000
+    items = []
+    for post in payload.get("items", []):
+        if str(post.get("account_id", "")) not in allowed:
+            continue
+        try:
+            timestamp = int(post.get("timestamp", 0))
+            if timestamp < cutoff or timestamp > now.timestamp() * 1000 + 300_000:
+                continue
+            dt = datetime.fromtimestamp(timestamp / 1000, ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        title = clean_text(str(post.get("title", "")))
+        if not title or not re.fullmatch(r"https://m\.weibo\.cn/detail/\d+", str(post.get("url", ""))):
+            continue
+        published = parse_publication_time(post.get("original_timestamp") if post.get("is_retweet") else timestamp)
+        items.append(RawItem(
+            date=dt.strftime("%Y-%m-%d"), title=title, url=post["url"],
+            source_id=f"weibo-account:{post['account_id']}", source_name=str(post.get("source_name") or "关注微博"),
+            source_tier="指定媒体账号", source_type="微博账号", source_weight=12, source_trust=70,
+            kind="weibo", first_dt=dt, last_dt=dt, count=1,
+            published_dt=published.replace(tzinfo=None) if published else None,
+            publication_source=("weibo:original_created_at_ts" if post.get("is_retweet") else "weibo:created_at_ts") if published else "",
+            collected_dt=collected.replace(tzinfo=None) if collected else None,
+            summary=clean_text(str(post.get("summary", "")))[:500],
+            score=item_score(title, 12, 1, None, 70),
+            rank_label="账号动态", metric_label="按发布时间", labels=["关注微博"],
+        ))
+    return sorted(items, key=lambda item: item.last_dt, reverse=True)
 
 
 def load_items(output_root: Path, dates: list[str]) -> list[RawItem]:
@@ -862,7 +985,111 @@ def load_items(output_root: Path, dates: list[str]) -> list[RawItem]:
     for date in dates:
         items.extend(load_hotlist_items(output_root, date))
         items.extend(load_rss_items(output_root, date))
+    items.extend(load_weibo_items(output_root))
     return items
+
+
+def load_native_pool_items(output_root: Path) -> tuple[list[RawItem], list[dict]]:
+    from home_source_pool import FEEDS, PUBLIC_ONLY_FEEDS, load_config, read_snapshot, public_record
+    items, statuses = [], []
+    config = load_config()
+    try:
+        manifest = json.loads((output_root / "source-pool" / "status.json").read_text())
+        attempts = {entry["source_id"]: entry for entry in manifest.get("sources", [])}
+    except (OSError, ValueError, KeyError, TypeError):
+        attempts = {}
+    for feed in config.get("native_feeds", []):
+        if feed not in FEEDS:
+            continue
+        snapshot = read_snapshot(output_root / "source-pool" / f"{feed}.json")
+        if feed in PUBLIC_ONLY_FEEDS and snapshot.get("public_only") is not True:
+            snapshot = {}
+        fetched = parse_publication_time(snapshot.get("fetched_at"))
+        statuses.append({"source_id": feed, "name": FEEDS[feed], "count": len(snapshot.get("items", [])),
+                         "fetched_at": fetched.isoformat() if fetched else None,
+                         "window_complete": snapshot.get("window_complete") is True,
+                         "last_fetch_ok": attempts.get(feed, {}).get("ok", bool(snapshot)),
+                         "available": bool(snapshot)})
+        source_id = "jin10-flash" if feed == "jin10-all" else feed
+        tier, source_type, weight, trust = profile_for(source_id, FEEDS[feed])
+        for raw in snapshot.get("items", []):
+            if not isinstance(raw, dict) or not public_record(feed, raw):
+                continue
+            published = parse_publication_time(raw.get("ctime") if feed == "cls-telegraph" else raw.get("published_at"))
+            title = clean_text(raw.get("title", ""))
+            if published is None or not title:
+                continue
+            observed = parse_publication_time(snapshot.get("item_observed_at", {}).get(str(raw.get("id")))) or fetched
+            dt = published.replace(tzinfo=None)
+            items.append(RawItem(
+                date=dt.strftime("%Y-%m-%d"), title=title, url=str(raw.get("url") or ""),
+                source_id=source_id, source_name=FEEDS[feed], source_tier=tier, source_type=source_type,
+                source_weight=weight, source_trust=trust, kind={"cls-telegraph": "cls", "jin10-all": "jin10", "jiemian-flash": "jiemian"}[feed],
+                first_dt=dt, last_dt=dt, published_dt=dt, collected_dt=observed.replace(tzinfo=None) if observed else None,
+                publication_source={"cls-telegraph": "cls:ctime", "jin10-all": "jin10:time", "jiemian-flash": "jiemian:publishtime"}[feed],
+                summary=clean_text(raw.get("content") or raw.get("summary") or "")[:6000],
+                native_id=f"{feed}:{raw.get('id')}" if raw.get("id") is not None else "",
+                score=item_score(title, weight, 1, None, trust), rank_label="来源动态", metric_label="按原文发布时间",
+                labels=["全量来源流"],
+            ))
+    return items, statuses
+
+
+def home_representative(items):
+    def priority(item):
+        headline = clean_headline(item)
+        factual = any(re.search(pattern, headline.lower()) for pattern in ACTION_RULES.values()) or bool(re.search(r"死亡|粉丝|清零|被查|老鼠仓", headline))
+        return factual, display_score(item), -len(headline)
+    return max(items, key=priority)
+
+
+def cluster_home_events(items: list[RawItem], *, registry_path: Path | None = None, stats: dict | None = None,
+                        aliases: dict | None = None) -> list[Event]:
+    events = []
+    registry = EventRegistry(registry_path)
+    try:
+        for group in registry.assign(deduplicate_reports(items)):
+            event = Event(key=group.key, progresses=group.progresses)
+            for item in group.items:
+                event.add(item)
+            event.source_ids = {publisher_id(item) for item in group.items}
+            finalize_event(event)
+            event.title = clean_headline(home_representative(event.items))
+            event.category = classify_home_event(event.title, event.items)
+            events.append(event)
+        if stats is not None:
+            stats.update(registry.stats)
+        if aliases is not None:
+            aliases.update(registry.aliases())
+    finally:
+        registry.close()
+    return sorted(events, key=lambda event: (event.score, event.last_dt), reverse=True)
+
+
+def current_event_view(event: Event, cutoff: datetime) -> Event | None:
+    """Filter visibility, not identity; a later duplicate cannot revive an old node."""
+    recent = [item for item in event.items if item.published_dt is not None and item.publication_source
+              and cutoff <= china_time(item.published_dt) <= datetime.now(CHINA) + timedelta(minutes=5)]
+    progresses = []
+    if event.progresses:
+        allowed = {item.doc_id or document_id(item) for item in recent}
+        for progress in event.progresses:
+            members = [item for item in progress.items if (item.doc_id or document_id(item)) in allowed]
+            if members:
+                progresses.append(HomeProgress(progress.key, event.key, progress.title, progress.kind,
+                    progress.first_reported_at, members, [item.doc_id or document_id(item) for item in members]))
+        active = {key for progress in progresses for key in progress.doc_ids}
+        recent = [item for item in recent if (item.doc_id or document_id(item)) in active]
+    if not recent:
+        return None
+    view = Event(key=event.key, progresses=progresses)
+    for item in recent:
+        view.add(item)
+    view.source_ids = {publisher_id(item) for item in recent}
+    finalize_event(view)
+    view.title = clean_headline(home_representative(recent))
+    view.category = classify_home_event(view.title, recent)
+    return view
 
 
 def match_topic(text: str) -> str | None:
@@ -1048,7 +1275,7 @@ def trend_status(event: Event) -> str:
         return "持续"
     if event.source_count >= 3:
         return "扩散"
-    return "新近"
+    return "已收录"
 
 
 def is_trackable(event: Event) -> bool:
@@ -1104,8 +1331,8 @@ def layout(title: str, body: str, active: str = "home") -> str:
     nav = [
         ("home", "/", "领域分类"),
         ("daily", "/daily/", "日报"),
-        ("timeline", "/timeline/", "热点脉络"),
         ("raw", "/hotlists/", "来源热榜"),
+        ("weibo", "/hotlists/weibo/", "关注微博"),
     ]
     nav_html = "".join(
         f'<a class="{ "active" if key == active else "" }" href="{href}">{label}</a>'
@@ -1267,6 +1494,14 @@ def layout(title: str, body: str, active: str = "home") -> str:
     .mini-chip.hot {{ background: #fff1ef; color: var(--red); }}
     .source-controls {{ display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; width: 100%; margin-top: 14px; }}
     .source-section {{ margin-bottom: 22px; }}
+    .source-heading {{ align-items: center; flex-wrap: wrap; }}
+    .source-heading-main {{ display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 12px; min-width: 0; flex: 1; }}
+    .source-heading-main .category-count {{ white-space: nowrap; }}
+    .source-refresh-btn {{ flex: 0 0 auto; min-height: 36px; border-color: #176b87; color: #176b87; white-space: nowrap; }}
+    .source-refresh-btn:hover:not(:disabled) {{ background: #edf6fa; }}
+    .source-refresh-btn:focus-visible {{ outline: 2px solid #176b87; outline-offset: 3px; }}
+    .source-refresh-btn:disabled {{ opacity: .72; cursor: wait; }}
+    .source-section .live-refresh-status {{ margin: 0 0 12px; }}
     .source-item-list {{ background: #fff; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }}
     .source-item {{ display: grid; grid-template-columns: 48px minmax(0, 1fr); gap: 12px; padding: 12px 14px; border-top: 1px solid var(--line); }}
     .source-item:first-child {{ border-top: 0; }}
@@ -1276,7 +1511,7 @@ def layout(title: str, body: str, active: str = "home") -> str:
     @media (max-width: 860px) {{
       .topbar, .page-head {{ align-items: flex-start; flex-direction: column; }}
       .topbar {{ position: static; }}
-      nav {{ width: 100%; overflow-x: auto; flex-wrap: nowrap; padding-bottom: 2px; }}
+      nav {{ width: 100%; overflow-x: auto; flex-wrap: nowrap; padding-bottom: 2px; justify-content: flex-start; }}
       nav a {{ white-space: nowrap; }}
       .grid, .two-col {{ grid-template-columns: 1fr; }}
       .side {{ position: static; }}
@@ -1345,42 +1580,72 @@ def event_card(event: Event, rank: int | None = None, compact: bool = False) -> 
     """
 
 
-def home_event_row(event: Event, rank: int) -> str:
+def home_event_row(event: Event, rank: int, *, dynamic: bool = True,
+                   allowed_categories: tuple[str, ...] | None = None) -> str:
     title = e(event.title)
-    title_html = f'<a href="{e(event.url)}" target="_blank" rel="noopener noreferrer">{title}</a>' if event.url else title
-    source_names = sorted({item.source_name for item in event.items})
+    primary_url = safe_link(event.url)
+    title_html = f'<a href="{e(primary_url)}" target="_blank" rel="noopener noreferrer">{title}</a>' if primary_url else title
+    source_names = sorted({publisher_name(item) for item in event.items})
     source_preview = " / ".join(source_names[:4]) + (" 等" if len(source_names) > 4 else "")
-    first = event.first_dt.strftime("%H:%M")
-    last = event.last_dt.strftime("%H:%M")
-    rank_text = f"最高第 {event.best_rank}" if event.best_rank else "RSS"
-    related_items = representative_items(event, 6)
-    related = "".join(
-        f'<li><a href="{e(item.url)}" target="_blank" rel="noopener noreferrer">{e(item.title)}</a>'
-        f'<br><span>{e(item.source_name)} · {item.last_dt.strftime("%H:%M")}'
-        f'{(" · 最高第" + str(item.best_rank)) if item.best_rank else ""}</span></li>'
-        for item in related_items
-    )
-    details = (
-        f'<details><summary>相关报道</summary><ul class="related">{related}</ul></details>'
-        if len(related_items) > 1
-        else ""
-    )
+    published = [china_time(item.published_dt) for item in event.items if item.published_dt is not None]
+    first = min(published).strftime("%m-%d %H:%M")
+    last = max(published).strftime("%m-%d %H:%M")
+    publish_label = first if first == last else f"{first} — {last}"
+    captures = [china_time(item.collected_dt) for item in event.items if item.collected_dt is not None]
+    capture_label = max(captures).strftime("%m-%d %H:%M") if captures else "未提供"
+    expires_ms = int((min(published) + timedelta(hours=WINDOW_HOURS)).timestamp() * 1000)
+    source_counts = {}
+    for item in event.items:
+        name = publisher_name(item)
+        source_counts[name] = source_counts.get(name, 0) + 1
+    rank_text = f"最高第 {event.best_rank}" if event.best_rank else ("微博动态" if any(item.kind == "weibo" for item in event.items) else "来源动态")
+    related_items = sorted(event.items, key=lambda item: (item.published_dt, item.source_trust), reverse=True)
+    nodes = []
+    progresses = sorted(event.progresses, key=lambda progress: (progress.first_reported_at, progress.key), reverse=True)
+    last_progress_ms = int(max((china_time(progress.first_reported_at) for progress in progresses),
+                              default=max(published)).timestamp() * 1000)
+    for progress in progresses:
+        related = "".join(
+            f'<li data-doc-id="{e(item.doc_id or document_id(item))}"><a href="{e(safe_link(item.url))}" target="_blank" rel="noopener noreferrer">{e(item.title)}</a>'
+            f'<br><span>{e(item.source_name)} · 发布 {item.published_dt.strftime("%m-%d %H:%M")}</span></li>'
+            for item in sorted(progress.items, key=lambda item: (item.published_dt, item.source_trust), reverse=True)
+        )
+        nodes.append(f'<section class="progress-node" data-progress-id="{e(progress.key)}" data-progress-type="{e(progress.kind)}">'
+                     f'<h4>{e(TYPE_LABELS.get(progress.kind, "进展"))} · {e(progress.title)}</h4>'
+                     f'<div class="row-meta">首次报道 {china_time(progress.first_reported_at).strftime("%m-%d %H:%M")} · {len(progress.doc_ids)} 条来源报道</div>'
+                     f'<ul class="related">{related}</ul></section>')
+    details = (f'<details class="event-progress"><summary>同一事件 · {len(progresses)} 个进展 · {len(related_items)} 条来源报道</summary>{"".join(nodes)}</details>'
+               if len(related_items) > 1 or len(progresses) > 1 else "")
+    latest = (f'<div class="latest-progress">最新进展：{e(progresses[0].title)}</div>' if len(progresses) > 1 else "")
     tags = []
-    if event.category != "general":
-        tags.append(f'<span class="mini-chip hot">{e(category_label(event.category))}</span>')
+    tags.append(f'<span class="mini-chip hot">{e(home_category_label(event.category))}</span>')
     tags.extend([
         f'<span class="mini-chip">{e(rank_text)}</span>',
         f'<span class="mini-chip">{event.source_count} 源</span>',
+        f'<span class="mini-chip">{len(progresses) or 1} 个进展</span>',
     ])
-    if event.status:
+    tags.append('<span class="mini-chip">近24h发布</span>')
+    if event.status and event.status not in {"新近", "已收录"}:
         tags.append(f'<span class="mini-chip">{e(event.status)}</span>')
+    future_states = []
+    if dynamic:
+        for boundary in sorted(set(published))[:-1]:
+            remaining = [item for item in event.items if china_time(item.published_dt) > boundary]
+            future = current_event_view(event, boundary + timedelta(microseconds=1))
+            if future is None:
+                continue
+            until = int((min(china_time(item.published_dt) for item in remaining) + timedelta(hours=WINDOW_HOURS)).timestamp() * 1000)
+            allowed = allowed_categories is None or future.category in allowed_categories
+            future_states.append({"until": until, "html": home_event_row(future, rank, dynamic=False,
+                                  allowed_categories=allowed_categories) if allowed else ""})
     return f"""
-    <article class="classified-row" data-category="{e(event.category)}" data-score="{event.score:.1f}">
+    <article class="classified-row" data-event-id="{e(event.key)}" data-progress-ids="{e(json.dumps([progress.key for progress in progresses]))}" data-progress-count="{len(progresses) or 1}" data-doc-ids="{e(json.dumps([item.doc_id or document_id(item) for item in event.items]))}" data-category="{e(event.category)}" data-score="{event.score:.1f}" data-last-progress-at="{last_progress_ms}" data-expires-at="{expires_ms}" data-future-states="{e(json.dumps(future_states, ensure_ascii=False))}" data-item-count="{len(event.items)}" data-source-counts="{e(json.dumps(source_counts, ensure_ascii=False))}">
       <div class="row-rank">#{rank}</div>
       <div>
         <h3>{title_html}</h3>
-        <div class="row-meta">{e(source_preview)} · {first} - {last} · 累计 {event.count} 次出现</div>
+        <div class="row-meta">{e(source_preview)} · 发布 {publish_label} · 最近采集 {capture_label}</div>
         <div class="row-tags">{''.join(tags)}</div>
+        {latest}
         {details}
       </div>
     </article>
@@ -1524,27 +1789,35 @@ def market_watch_html() -> str:
     """
 
 
-def render_home(events: list[Event], latest_date: str, output_root: Path, top: int) -> None:
-    today_events = [event for event in events if latest_date in event.dates]
-    today_events = sorted(today_events, key=lambda event: event.score, reverse=True)
-    category_groups: dict[str, list[Event]] = {category: [] for category in CATEGORY_ORDER}
+def render_home(events: list[Event], latest_date: str, output_root: Path, top: int, freshness_report: dict | None = None) -> None:
+    from home_refresh import markup as refresh_markup
+    now = datetime.now(CHINA)
+    cutoff = now - timedelta(hours=WINDOW_HOURS)
+    # Protect direct callers and a build crossing the publication cutoff boundary.
+    # The registry already assigned identities. Rendering/expiry must not recluster
+    # in memory and silently replace stable IDs with a different set of IDs.
+    today_events = [view for event in events if (view := current_event_view(event, cutoff))
+                    and view.category in HOME_CATEGORY_ORDER]
+    category_groups: dict[str, list[Event]] = {category: [] for category in HOME_CATEGORY_ORDER}
     for event in today_events:
-        category_groups.setdefault(event.category or "general", []).append(event)
+        if event.category in category_groups:
+            category_groups[event.category].append(event)
 
     total_raw_items = sum(len(event.items) for event in today_events)
-    total_sources = len({item.source_id for event in today_events for item in event.items})
+    total_sources = len({publisher_id(item) for event in today_events for item in event.items})
     source_counts: dict[str, int] = {}
     for event in today_events:
         for item in event.items:
-            source_counts[item.source_name] = source_counts.get(item.source_name, 0) + 1
+            name = publisher_name(item)
+            source_counts[name] = source_counts.get(name, 0) + 1
 
     controls = [
         f'<button class="control-btn active" data-category="all">全部 <span>{len(today_events)}</span></button>'
     ]
-    for category in VISIBLE_CATEGORY_ORDER:
+    for category in HOME_CATEGORY_ORDER:
         count = len(category_groups.get(category, []))
         controls.append(
-            f'<button class="control-btn" data-category="{e(category)}">{e(category_label(category))} <span>{count}</span></button>'
+            f'<button class="control-btn" data-category="{e(category)}">{e(home_category_label(category))} <span>{count}</span></button>'
         )
 
     sections = []
@@ -1554,22 +1827,20 @@ def render_home(events: list[Event], latest_date: str, output_root: Path, top: i
         <section class="category-section" data-category-section="all">
           <div class="category-head">
             <h2>全部</h2>
-            <span class="category-count">{len(today_events)} 个去重事件，包含未归入具体领域的内容</span>
+            <span class="category-count">{len(today_events)} 个符合关注领域的去重事件</span>
           </div>
           <div class="classified-list">{all_rows}</div>
         </section>
         """
     )
-    for category in VISIBLE_CATEGORY_ORDER:
+    for category in HOME_CATEGORY_ORDER:
         group = category_groups.get(category, [])
-        if not group:
-            continue
         rows = "\n".join(home_event_row(event, idx + 1) for idx, event in enumerate(group))
         sections.append(
             f"""
             <section class="category-section" data-category-section="{e(category)}">
               <div class="category-head">
-                <h2>{e(category_label(category))}</h2>
+                <h2>{e(home_category_label(category))}</h2>
                 <span class="category-count">{len(group)} 个去重事件</span>
               </div>
               <div class="classified-list">{rows}</div>
@@ -1582,56 +1853,127 @@ def render_home(events: list[Event], latest_date: str, output_root: Path, top: i
         for name, count in sorted(source_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:16]
     )
     body = f"""
-    <div class="page-head category-page-head">
+    <style>#home-empty {{ padding:22px; border:1px solid var(--line); border-radius:8px; background:#fff; color:var(--muted); line-height:1.7; }} .progress-node {{ margin:14px 0 0; padding:0 0 0 12px; border-left:3px solid #dbe7fb; overflow-wrap:anywhere; }} .progress-node h4 {{ margin:0 0 5px; font-size:15px; line-height:1.6; }} .latest-progress {{ margin-top:10px; color:var(--muted); font-size:14px; overflow-wrap:anywhere; }}</style>
+    <div class="page-head category-page-head" data-home-generation="{now.isoformat()}">
       <div>
-        <h1>今日领域分类</h1>
-        <div class="sub">{e(latest_date)} · “全部”包含所有去重事件；领域按钮只展示已明确归类的内容，不再单独设置“综合”。</div>
+        <div class="home-title-line"><h1>今日领域分类</h1><button id="home-refresh-button" type="button" disabled aria-controls="home-refresh-panel">连接后台…</button></div>
+        <div class="sub">只展示原文在最近24小时发布的内容 · 北京时间 · 本页生成于 {now.strftime('%m-%d %H:%M')}，不是文章发布时间。</div>
       </div>
       <div class="controls category-controls" id="category-controls">
         {''.join(controls)}
       </div>
     </div>
+    {refresh_markup(now.isoformat())}
     <div class="category-summary">
-      <div class="summary-cell"><strong>{len(today_events)}</strong><span>去重事件</span></div>
-      <div class="summary-cell"><strong>{total_raw_items}</strong><span>热榜原始条目</span></div>
-      <div class="summary-cell"><strong>{total_sources}</strong><span>来源标签</span></div>
-      <div class="summary-cell"><strong>{sum(1 for category in VISIBLE_CATEGORY_ORDER if category_groups.get(category))}</strong><span>有内容的领域</span></div>
+      <div class="summary-cell"><strong id="home-event-count">{len(today_events)}</strong><span>近24h去重事件</span></div>
+      <div class="summary-cell"><strong id="home-item-count">{total_raw_items}</strong><span>核实时效条目</span></div>
+      <div class="summary-cell"><strong id="home-source-count">{total_sources}</strong><span>媒体来源</span></div>
+      <div class="summary-cell"><strong id="home-domain-count">{sum(1 for category in HOME_CATEGORY_ORDER if category_groups.get(category))}</strong><span>有内容的领域</span></div>
     </div>
+    <p id="home-empty" style="display:none" role="status">当前领域暂无已核实发布时间且在24小时内的内容。不用旧闻补位。<a href="/hotlists/">查看来源热榜与采集记录</a></p>
     <div class="grid">
       <main id="event-list">{''.join(sections)}</main>
       <aside class="side side-stack">
         {market_watch_html()}
         <section class="panel side-info">
-          <h3>分类口径</h3>
-          <div class="sub">每条内容只进一个主分类。未能明确判断领域的内容不单独成类，只保留在“全部”中。</div>
-          <h3 class="section-title">来源数量</h3>
-          {sources_html}
+          <h3>来源数量</h3>
+          <div id="home-source-counts">{sources_html}</div>
         </section>
       </aside>
     </div>
     <script>
       const list = document.getElementById('event-list');
-      const buttons = Array.from(document.querySelectorAll('.control-btn'));
+      const buttons = Array.from(document.querySelectorAll('#category-controls button[data-category]'));
+      let selectedCategory = 'all';
       function applyCategory(name) {{
+        selectedCategory = name;
         const sections = Array.from(list.querySelectorAll('.category-section'));
         sections.forEach(section => {{
           const visible = section.dataset.categorySection === name;
           section.style.display = visible ? '' : 'none';
         }});
         buttons.forEach(btn => btn.classList.toggle('active', btn.dataset.category === name));
+        const count = list.querySelectorAll('.category-section[data-category-section="' + name + '"] .classified-row').length;
+        document.getElementById('home-empty').style.display = count ? 'none' : '';
         localStorage.setItem('newshot-category', name);
+      }}
+      function expireOldRows() {{
+        const now = Date.now();
+        let changed = false;
+        const allList = list.querySelector('[data-category-section="all"] .classified-list');
+        allList.querySelectorAll('.classified-row').forEach(row => {{
+          const expiry = Number(row.dataset.expiresAt);
+          if (!Number.isFinite(expiry) || expiry <= now) {{
+            changed = true;
+            const states = JSON.parse(row.dataset.futureStates || '[]');
+            const next = states.find(state => state.until > now);
+            if (!next) {{ row.remove(); return; }}
+            // HTML is generated and escaped by the same server renderer, not
+            // taken directly from a source feed or executed as JavaScript.
+            const template = document.createElement('template');
+            template.innerHTML = next.html.trim();
+            const replacement = template.content.firstElementChild;
+            if (!buttons.some(button => button.dataset.category === replacement.dataset.category)) {{ row.remove(); return; }}
+            replacement.dataset.futureStates = JSON.stringify(states.filter(state => state.until > next.until));
+            const open = row.querySelector('details')?.open;
+            if (open && replacement.querySelector('details')) replacement.querySelector('details').open = true;
+            row.replaceWith(replacement);
+          }}
+        }});
+        const allRows = Array.from(allList.querySelectorAll('.classified-row')).sort((a,b) => Number(b.dataset.score) - Number(a.dataset.score));
+        allRows.forEach((row,index) => {{ row.querySelector('.row-rank').textContent = '#' + (index + 1); allList.append(row); }});
+        if (changed) {{
+          list.querySelectorAll('.category-section').forEach(section => {{
+            const category = section.dataset.categorySection;
+            if (category === 'all') return;
+            const copies = allRows.filter(row => row.dataset.category === category).map((row,index) => {{
+              const copy = row.cloneNode(true); copy.querySelector('.row-rank').textContent = '#' + (index + 1); return copy;
+            }});
+            section.querySelector('.classified-list').replaceChildren(...copies);
+          }});
+        }}
+        const counts = Object.assign(Object.create(null), {{all:allRows.length}});
+        const sources = Object.create(null);
+        let itemCount = 0;
+        allRows.forEach(row => {{
+          counts[row.dataset.category] = (counts[row.dataset.category] || 0) + 1;
+          itemCount += Number(row.dataset.itemCount) || 0;
+          Object.entries(JSON.parse(row.dataset.sourceCounts || '{{}}')).forEach(([name,count]) => sources[name] = (sources[name] || 0) + count);
+        }});
+        buttons.forEach(button => {{
+          const count = counts[button.dataset.category] || 0;
+          button.querySelector('span').textContent = count;
+          const section = list.querySelector('[data-category-section="' + button.dataset.category + '"]');
+          if (section) section.querySelector('.category-count').textContent = count + ' 个近24h去重事件';
+        }});
+        document.getElementById('home-event-count').textContent = allRows.length;
+        document.getElementById('home-item-count').textContent = itemCount;
+        document.getElementById('home-source-count').textContent = Object.keys(sources).length;
+        document.getElementById('home-domain-count').textContent = buttons.filter(button => button.dataset.category !== 'all' && (counts[button.dataset.category] || 0) > 0).length;
+        const sourceList = document.getElementById('home-source-counts');
+        sourceList.replaceChildren();
+        Object.entries(sources).sort((a,b) => b[1] - a[1]).slice(0,16).forEach(([name,count]) => {{
+          const row = document.createElement('div'); row.className = 'source-row';
+          const label = document.createElement('span'); label.textContent = name;
+          const value = document.createElement('strong'); value.textContent = count;
+          row.append(label,value); sourceList.append(row);
+        }});
+        applyCategory(selectedCategory);
       }}
       buttons.forEach(btn => btn.addEventListener('click', () => applyCategory(btn.dataset.category)));
       const initialCategory = localStorage.getItem('newshot-category') || 'all';
       applyCategory(buttons.some(btn => btn.dataset.category === initialCategory) ? initialCategory : 'all');
+      expireOldRows();
+      window.setInterval(expireOldRows, 60000);
+      document.addEventListener('visibilitychange', () => {{ if (!document.hidden) expireOldRows(); }});
     </script>
     """
     page = layout("今日领域分类", body, "home")
     output_root.mkdir(parents=True, exist_ok=True)
-    (output_root / "index.html").write_text(page, encoding="utf-8")
+    atomic_text(output_root / "index.html", page)
     curated_dir = output_root / "curated"
     curated_dir.mkdir(parents=True, exist_ok=True)
-    (curated_dir / "index.html").write_text(page, encoding="utf-8")
+    atomic_text(curated_dir / "index.html", page)
 
 
 def archive_entries(events: list[Event], dates: list[str]) -> list[tuple[str, str]]:
@@ -1648,6 +1990,8 @@ def source_item_row(item: RawItem, rank: int) -> str:
     rank_text = item.rank_label or (f"热榜第 {item.best_rank}" if item.best_rank else "RSS")
     metric_text = item.metric_label or f"{item.count} 次"
     time_span = f"{item.first_dt.strftime('%H:%M')} - {item.last_dt.strftime('%H:%M')}"
+    if item.source_id in {JIN10_SOURCE_ID, JIEMIAN_SOURCE_ID}:
+        time_span = "发布 " + item.first_dt.strftime("%m-%d %H:%M")
     tags = []
     if item.official_categories:
         tags.extend(f'<span class="mini-chip hot">{e(label)}</span>' for label in item.official_categories)
@@ -1663,7 +2007,7 @@ def source_item_row(item: RawItem, rank: int) -> str:
         tags.append(f'<span class="mini-chip">{e(rank_text)}</span>')
     tags.append(f'<span class="mini-chip">{e(metric_text)}</span>')
     return f"""
-    <article class="source-item" data-source-id="{e(item.source_id)}">
+    <article class="source-item" data-source-id="{e(item.source_id)}" data-published-at="{e(china_time(item.published_dt).isoformat() if item.published_dt else '')}">
       <div class="source-rank">#{rank}</div>
       <div>
         <h3>{title_html}</h3>
@@ -1677,26 +2021,44 @@ def source_item_row(item: RawItem, rank: int) -> str:
 def render_source_hotlists(output_root: Path, latest_date: str) -> None:
     base_items = [item for item in load_hotlist_items(output_root, latest_date) if item.title]
     base_items = sorted(base_items, key=lambda item: (item.score, item.count, item.last_dt), reverse=True)
-    jin10_items = load_jin10_items(latest_date)
-    items = base_items + jin10_items
+    jin10_items, jin10_state = load_jin10_source_items(output_root)
+    jin10_fetched = jin10_state.get("fetched_at")
+    jin10_capture = jin10_fetched.strftime("%m-%d %H:%M") if jin10_fetched else "未知"
+    coverage = "最近24小时窗口已覆盖" if jin10_state.get("window_complete") else "尚未确认抓全最近24小时"
+    jin10_note = f"金十首页公开快讯：普通+重要+热门均收录，不按重要性或领域预筛；采集于 {jin10_capture}，{coverage}。来源页与领域分类读取同一候选池；VIP、PLUS、登录及付费受限条目直接跳过。"
+    if not jin10_items:
+        jin10_note = "金十暂无已确认公开可读的缓存，可点击“刷新快讯”获取；不尝试登录或访问受限内容，入口仍保留。"
+    if jin10_state.get("errors"):
+        jin10_note += " 最近采集提示：" + "；".join(jin10_state["errors"])
+    native_items, native_states = load_native_pool_items(output_root)
+    jiemian_items = [item for item in native_items if item.source_id == JIEMIAN_SOURCE_ID]
+    jiemian_state = next((state for state in native_states if state["source_id"] == JIEMIAN_SOURCE_ID), {})
+    items = base_items + jin10_items + jiemian_items + load_weibo_items(output_root)
     by_source: dict[str, list[RawItem]] = {}
     source_names: dict[str, str] = {}
     for item in items:
         by_source.setdefault(item.source_id, []).append(item)
         source_names[item.source_id] = item.source_name
-    if JIN10_SOURCE_ID in by_source:
-        by_source[JIN10_SOURCE_ID] = sorted(by_source[JIN10_SOURCE_ID], key=lambda item: item.last_dt, reverse=True)
+    by_source.setdefault(JIN10_SOURCE_ID, [])
+    source_names[JIN10_SOURCE_ID] = JIN10_SOURCE_NAME
+    by_source[JIN10_SOURCE_ID].sort(key=lambda item: item.last_dt, reverse=True)
+    by_source.setdefault(JIEMIAN_SOURCE_ID, [])
+    source_names[JIEMIAN_SOURCE_ID] = JIEMIAN_SOURCE_NAME
+    by_source[JIEMIAN_SOURCE_ID].sort(key=lambda item: item.last_dt, reverse=True)
+    for source_id in by_source:
+        if source_id.startswith("weibo-account:"):
+            by_source[source_id].sort(key=lambda item: item.last_dt, reverse=True)
 
-    source_order = sorted(by_source, key=lambda source_id: (-len(by_source[source_id]), source_names[source_id]))
+    priority = {JIN10_SOURCE_ID: 0, JIEMIAN_SOURCE_ID: 1}
+    source_order = sorted(by_source, key=lambda source_id: (priority.get(source_id, 2), -len(by_source[source_id]), source_names[source_id]))
     controls = [f'<button class="control-btn active" data-source="all">全部 <span>{len(items)}</span></button>']
     for source_id in source_order:
         controls.append(
             f'<button class="control-btn" data-source="{e(source_id)}">{e(source_names[source_id])} <span>{len(by_source[source_id])}</span></button>'
         )
-        if source_id == JIN10_SOURCE_ID:
-            controls.append('<button class="control-btn live-refresh-btn" type="button" id="jin10-refresh">刷新金十 <span>实时</span></button>')
-    controls.append('<a class="control-btn" href="/hotlists/telegraph/">财联社电报 <span>时间流</span></a>')
+    controls.append('<a class="control-btn live-refresh-btn" href="/hotlists/telegraph/">财联社电报 <span>实时</span></a>')
 
+    controls.append('<a class="control-btn live-refresh-btn" href="/hotlists/weibo/">关注微博 <span>指定账号</span></a>')
     all_rows = "\n".join(source_item_row(item, idx + 1) for idx, item in enumerate(items))
     sections = [
         f"""
@@ -1714,14 +2076,36 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
         if source_id == JIN10_SOURCE_ID:
             source_items = sorted(source_items, key=lambda item: item.last_dt, reverse=True)
         rows = "\n".join(source_item_row(item, idx + 1) for idx, item in enumerate(source_items))
+        if source_id == JIN10_SOURCE_ID and not rows:
+            rows = '<p class="source-empty" role="status">金十暂时没有可用条目，入口仍保留。可点击“刷新快讯”重试。</p>'
+        source_note = ""
+        source_action = ""
+        list_id = ""
+        if source_id == JIN10_SOURCE_ID:
+            source_action = '<button class="control-btn source-refresh-btn" type="button" id="jin10-refresh" aria-controls="jin10-items" aria-describedby="jin10-refresh-status" title="获取金十最新公开快讯">刷新快讯</button>'
+            source_note = f'<div class="live-refresh-status" id="jin10-refresh-status" role="status" aria-live="polite">{e(jin10_note)}</div>'
+            list_id = ' id="jin10-items"'
+        if source_id == JIEMIAN_SOURCE_ID:
+            captured = parse_publication_time(jiemian_state.get("fetched_at"))
+            captured_label = captured.strftime("%m-%d %H:%M") if captured else "未知"
+            coverage = "最近24小时窗口已覆盖" if jiemian_state.get("window_complete") else "尚未确认抓全最近24小时"
+            if not jiemian_state.get("last_fetch_ok", True):
+                coverage = "最近采集失败，保留已有公开缓存；" + coverage
+            source_note = f'<p class="sub" id="jiemian-source-status">公开滚动快报 · 按原文发布时间倒序 · 采集于 {e(captured_label)}，{e(coverage)}。会员、付费及登录受限内容不采集；随后台来源池更新。<a href="{e(JIEMIAN_LIST_URL)}" target="_blank" rel="noopener noreferrer">查看界面快报原页</a></p>'
+            if not rows:
+                rows = '<p class="source-empty" role="status">界面新闻·快报暂无可用公开缓存，入口保留；等待下一轮采集，不用旧闻补位。</p>'
         sections.append(
             f"""
             <section class="source-section" data-source-section="{e(source_id)}">
-              <div class="category-head">
-                <h2>{e(source_names[source_id])}</h2>
-                <span class="category-count" data-source-count="{e(source_id)}">{len(source_items)} 条热榜条目</span>
+              <div class="category-head source-heading">
+                <div class="source-heading-main">
+                  <h2>{e(source_names[source_id])}</h2>
+                  <span class="category-count" data-source-count="{e(source_id)}">{len(source_items)} 条热榜条目</span>
+                </div>
+                {source_action}
               </div>
-              <div class="source-item-list">{rows}</div>
+              {source_note}
+              <div class="source-item-list"{list_id}>{rows}</div>
             </section>
             """
         )
@@ -1730,7 +2114,7 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
         f'<div class="source-row" data-source-row="{e(source_id)}"><span>{e(source_names[source_id])}</span><strong>{len(by_source[source_id])}</strong></div>'
         for source_id in source_order
     )
-    source_rows += '<a class="source-row" href="/hotlists/telegraph/"><span>财联社电报</span><strong>时间流</strong></a>'
+    source_rows += '<a class="source-row" href="/hotlists/telegraph/"><span>财联社电报</span><strong>实时</strong></a>'
     first_dt = min((item.first_dt for item in items), default=None)
     last_dt = max((item.last_dt for item in items), default=None)
     time_range = f"{first_dt.strftime('%H:%M')} - {last_dt.strftime('%H:%M')}" if first_dt and last_dt else "-"
@@ -1739,15 +2123,14 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
     <div class="page-head category-page-head">
       <div>
         <h1>来源热榜</h1>
-        <div class="sub">{e(latest_date)} · 按来源查看原始热榜条目，保留各平台排名和出现次数。</div>
+        <div class="sub">平台快照 {e(latest_date)} · 金十与关注微博按各自更新时间加载；界面快报按独立来源池更新。保留采集记录与平台排名，可能包含旧闻或未知发布时间；近24小时已核实内容请看“领域分类”。</div>
       </div>
       <div class="controls source-controls" id="source-controls">
         {''.join(controls)}
       </div>
-      <div class="live-refresh-status" id="jin10-refresh-status" aria-live="polite"></div>
     </div>
     <div class="category-summary">
-      <div class="summary-cell"><strong>{len(items)}</strong><span>热榜条目</span></div>
+      <div class="summary-cell"><strong id="source-total-count">{len(items)}</strong><span>热榜条目</span></div>
       <div class="summary-cell"><strong>{len(source_order)}</strong><span>来源标签</span></div>
       <div class="summary-cell"><strong>{time_range}</strong><span>采集时间</span></div>
       <div class="summary-cell"><strong>{sum(1 for item in items if item.best_rank and item.best_rank <= 5)}</strong><span>高位热榜</span></div>
@@ -1790,23 +2173,25 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
 
       function renderJin10Row(item, rank) {{
         const title = escapeHtml(item.title || '');
-        const url = String(item.url || '');
+        const rawUrl = String(item.url || '');
+        const url = rawUrl.startsWith('https://') || rawUrl.startsWith('http://') ? rawUrl : '';
         const titleHtml = url
           ? '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer">' + title + '</a>'
           : title;
         const categories = Array.isArray(item.official_categories) ? item.official_categories : [];
         const labels = Array.isArray(item.labels) ? item.labels : [];
+        const displayLabels = labels.length ? labels : [item.rank_label || '普通快讯'];
         const tags = [
           ...categories.map(label => '<span class="mini-chip hot">' + escapeHtml(label) + '</span>'),
-          ...labels.map(label => '<span class="mini-chip">' + escapeHtml(label) + '</span>'),
+          ...displayLabels.map(label => '<span class="mini-chip">' + escapeHtml(label) + '</span>'),
           '<span class="mini-chip">' + escapeHtml(item.metric_label || '按时间倒序') + '</span>'
         ].join('');
         return [
-          '<article class="source-item" data-source-id="' + jin10SourceId + '">',
+          '<article class="source-item" data-source-id="' + jin10SourceId + '" data-published-at="' + escapeHtml(item.published_at || item.time || '') + '">',
           '  <div class="source-rank">#' + rank + '</div>',
           '  <div>',
           '    <h3>' + titleHtml + '</h3>',
-          '    <div class="source-item-meta">' + escapeHtml(item.source_name || '金十数据') + ' · ' + escapeHtml(item.time_label || '') + '</div>',
+          '    <div class="source-item-meta">' + escapeHtml(item.source_name || '金十数据') + ' · 发布 ' + escapeHtml(item.time ? item.time.slice(5,16) : item.time_label || '') + '</div>',
           '    <div class="row-tags">' + tags + '</div>',
           '  </div>',
           '</article>'
@@ -1820,13 +2205,16 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
         if (buttonCount) buttonCount.textContent = count;
         const sideCount = document.querySelector('[data-source-row="' + sourceId + '"] strong');
         if (sideCount) sideCount.textContent = count;
+        if (sourceId === 'all') document.getElementById('source-total-count').textContent = count;
       }}
 
       function replaceJin10Items(items) {{
         const jin10Section = sourceList.querySelector('[data-source-section="' + jin10SourceId + '"]');
         const jin10List = jin10Section ? jin10Section.querySelector('.source-item-list') : null;
         if (jin10List) {{
-          jin10List.innerHTML = items.map((item, index) => renderJin10Row(item, index + 1)).join('');
+          jin10List.innerHTML = items.length
+            ? items.map((item, index) => renderJin10Row(item, index + 1)).join('')
+            : '<p class="source-empty" role="status">金十当前没有可用条目，可稍后点击“刷新快讯”重试。</p>';
           setSourceCount(jin10SourceId, items.length);
         }}
 
@@ -1842,25 +2230,32 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
       }}
 
       async function refreshJin10() {{
-        if (!jin10Refresh) return;
+        if (!jin10Refresh || jin10Refresh.disabled) return;
         jin10Refresh.disabled = true;
         jin10Refresh.classList.add('refreshing');
+        jin10Refresh.textContent = '刷新中…';
+        jin10Refresh.setAttribute('aria-busy', 'true');
         if (jin10Status) jin10Status.textContent = '金十刷新中...';
         try {{
-          const response = await fetch('/api/jin10/flash?refresh=1&limit=80&ts=' + Date.now(), {{ cache: 'no-store' }});
+          const response = await fetch('/api/jin10/flash?refresh=1&limit=2000&pages=24&ts=' + Date.now(), {{ cache: 'no-store' }});
           if (!response.ok) throw new Error('HTTP ' + response.status);
           const payload = await response.json();
           if (!payload.ok) throw new Error(payload.error || '刷新失败');
-          const items = Array.isArray(payload.items) ? payload.items : [];
+          if (payload.public_only !== true) throw new Error('来源未确认仅包含公开内容，已停止更新');
+          if (!Array.isArray(payload.items)) throw new Error('金十返回的数据格式不正确');
+          const items = payload.items.slice().sort((a,b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
           replaceJin10Items(items);
-          const latest = items[0] && items[0].time ? items[0].time.slice(11, 16) : '--';
-          if (jin10Status) jin10Status.textContent = '金十已更新至 ' + latest + '，共 ' + items.length + ' 条';
+          const latest = items[0] && items[0].time ? items[0].time.slice(0, 16) : '暂无';
+          const coverage = payload.window_complete === true ? '已覆盖最近24小时' : '未确认抓全最近24小时';
+          if (jin10Status) jin10Status.textContent = '金十公开快讯已更新至 ' + latest + '，共 ' + items.length + ' 条（含普通快讯），' + coverage + '；无权限内容直接跳过。' + (payload.errors?.length ? ' ' + payload.errors.join('；') : '');
           applySource(jin10SourceId);
         }} catch (error) {{
-          if (jin10Status) jin10Status.textContent = '金十刷新失败：' + (error.message || String(error));
+          if (jin10Status) jin10Status.textContent = '金十刷新失败，保留原有条目：' + (error.message || String(error));
         }} finally {{
           jin10Refresh.disabled = false;
           jin10Refresh.classList.remove('refreshing');
+          jin10Refresh.textContent = '刷新快讯';
+          jin10Refresh.removeAttribute('aria-busy');
         }}
       }}
 
@@ -1872,11 +2267,56 @@ def render_source_hotlists(output_root: Path, latest_date: str) -> None:
     latest_dir = output_root / "html" / "latest"
     hotlists_dir.mkdir(parents=True, exist_ok=True)
     latest_dir.mkdir(parents=True, exist_ok=True)
-    (hotlists_dir / "index.html").write_text(page, encoding="utf-8")
-    (latest_dir / "current.html").write_text(page, encoding="utf-8")
+    atomic_text(hotlists_dir / "index.html", page)
+    atomic_text(latest_dir / "current.html", page)
+
+
+def select_site_daily(events: list[Event], top: int = 50, *, now: datetime | None = None,
+                      date: str | None = None) -> list[Event]:
+    """Seven-sector calendar-day ranking; archived days never expire at 24 hours.
+
+    No hot-list/score minimum, second classifier, reclustering or delivery history.
+    Recomputing a view selects this day's reports and keeps event/progress/doc IDs.
+    """
+    now = china_time(now or datetime.now(CHINA))
+    start = datetime.strptime(date or now.strftime("%Y-%m-%d"), "%Y-%m-%d").replace(tzinfo=CHINA)
+    end = start + timedelta(days=1)
+    views = []
+    for event in events:
+        members = [item for item in event.items if item.published_dt is not None
+                   and start <= china_time(item.published_dt) < end
+                   and china_time(item.published_dt) <= now + timedelta(minutes=5)]
+        if not members:
+            continue
+        view = current_event_view(replace(event, items=members), start)
+        if view and view.category in DAILY_CATEGORY_ORDER:
+            views.append(view)
+    # A later crawl must not break a tie by pretending it is a new progress.
+    def order(event):
+        latest = max((china_time(progress.first_reported_at) for progress in event.progresses),
+                     default=max(china_time(item.published_dt) for item in event.items))
+        return (-event.score, -latest.timestamp(), event.key)
+    return sorted(views, key=order)[:min(50, max(0, top))]
+
+
+def render_site_daily(events: list[Event], output_root: Path, top: int = 50,
+                      *, now: datetime | None = None, registry_path: Path | None = None,
+                      aliases: dict | None = None) -> None:
+    from site_daily_archive import publish
+    publish(events, output_root, top, now=now, registry_path=registry_path, aliases=aliases)
+
+
+def retire_timeline(output_root: Path) -> None:
+    """Retire the old entry without deleting raw history or dated daily archives."""
+    folder = output_root / "timeline"
+    folder.mkdir(parents=True, exist_ok=True)
+    atomic_text(folder / "index.html", '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+                '<meta http-equiv="refresh" content="0;url=/daily/"><title>NEWSHOT</title></head>'
+                '<body><a href="/daily/">查看日报</a></body></html>')
 
 
 def render_daily(events: list[Event], dates: list[str], latest_date: str, output_root: Path, top: int) -> None:
+    """Legacy archive renderer; not used by active website generation."""
     daily_dir = output_root / "daily"
     daily_dir.mkdir(parents=True, exist_ok=True)
     archive = archive_entries(events, dates)
@@ -2049,6 +2489,40 @@ def preserve_raw_latest(output_root: Path) -> None:
         shutil.copyfile(raw, hotlists / "index.html")
 
 
+def home_event_snapshot(events: list[Event], source_records: int, stats: dict, aliases: dict,
+                        freshness_report: dict, *, now: datetime | None = None) -> dict:
+    """One published contract for the homepage and Feishu; never recluster here."""
+    now = now or datetime.now(CHINA)
+    views = [view for event in events if (view := current_event_view(event, now - timedelta(hours=WINDOW_HOURS)))]
+    return {
+        "schema_version": 3, "model": "event-progress-doc", "pipeline": "shared-home-v1",
+        "generated_at": now.isoformat(), "source_records": source_records,
+        "categories": [{"id": key, "name": home_category_label(key)} for key in HOME_CATEGORY_ORDER],
+        "clustering": stats, "id_aliases": aliases,
+        "source_status": freshness_report.get("native_sources", []),
+        "events": [{
+            "id": event.key, "title": event.title, "url": event.url, "score": event.score,
+            "category": event.category, "displayed_on_home": event.category in HOME_CATEGORY_ORDER,
+            "source_count": event.source_count,
+            "progresses": [{
+                "id": progress.key, "event_id": event.key, "title": progress.title,
+                "type": progress.kind, "first_reported_at": china_time(progress.first_reported_at).isoformat(),
+                "doc_ids": progress.doc_ids,
+                "representative_doc_id": home_representative(progress.items).doc_id,
+                "representative_url": home_representative(progress.items).url,
+            } for progress in event.progresses],
+            "reports": [{
+                "doc_id": item.doc_id, "source_id": item.source_id, "source_name": item.source_name,
+                "publisher_id": publisher_id(item), "publisher_name": publisher_name(item),
+                "url": item.url, "title": item.title, "kind": item.kind,
+                "published_at": china_time(item.published_dt).isoformat(),
+                "publication_source": item.publication_source,
+                "collected_at": china_time(item.collected_dt or item.last_dt).isoformat(),
+            } for item in event.items],
+        } for event in views],
+    }
+
+
 def generate(
     output_root: Path,
     lookback_days: int,
@@ -2056,27 +2530,83 @@ def generate(
     daily_top: int,
     skip_daily: bool = False,
     hotlists_only: bool = False,
+    current_pages_only: bool = False,
+    event_db: Path | None = None,
+    cached_only: bool = False,
+    refresh_job_id: str | None = None,
+    refresh_stage: str | None = None,
 ) -> None:
+    if bool(refresh_job_id) != bool(refresh_stage) or (refresh_stage and refresh_stage not in {'public','final'}):
+        raise ValueError('Refresh publication requires a job ID and a valid stage')
+    if event_db is not None and (event_db.resolve() == output_root.resolve() or output_root.resolve() in event_db.resolve().parents):
+        raise ValueError("Event registry must be outside the published output directory")
     dates = recent_db_dates(output_root, lookback_days)
-    if not dates:
-        raise SystemExit("No TrendRadar database files found.")
-    latest_date = dates[-1]
+    latest_date = dates[-1] if dates else datetime.now(CHINA).strftime("%Y-%m-%d")
     if hotlists_only:
         render_source_hotlists(output_root, latest_date)
+        from weibo_page import render_weibo_page
+        render_weibo_page(output_root)
         print(f"[hotlists] generated source page for {latest_date}")
         return
-    home_items = [item for item in load_hotlist_items(output_root, latest_date) if item.title]
-    home_events = cluster_events(home_items)
-    items = [item for item in load_items(output_root, dates) if candidate_item(item)]
-    events = cluster_events(items)
-    preserve_raw_latest(output_root)
-    render_home(home_events, latest_date, output_root, home_top)
+    cutoff_date = (datetime.now(CHINA) - timedelta(hours=WINDOW_HOURS)).strftime("%Y-%m-%d")
+    home_dates = [date for date in recent_db_dates(output_root, max(lookback_days, 2)) if date >= cutoff_date]
+    home_dates = home_dates or [latest_date]
+    from home_source_pool import load_config
+    home_config = load_config()
+    home_items = []
+    for date in home_dates:
+        if home_config.get("trendradar", True):
+            home_items.extend(item for item in load_hotlist_items(output_root, date) if item.title)
+        if home_config.get("rss", True):
+            home_items.extend(item for item in load_rss_items(output_root, date) if item.title)
+    if home_config.get("weibo_followed", True):
+        home_items.extend(load_weibo_items(output_root))
+    native_items, source_statuses = load_native_pool_items(output_root)
+    home_items.extend(native_items)
+    raw_source_count = len(home_items)
+    home_items = deduplicate_reports(home_items)
+    home_items, freshness_report = select_home_items(home_items, output_root, **({"max_fetches": 0} if cached_only else {}))
+    freshness_report["native_sources"] = source_statuses
+    freshness_report["source_records_before_deduplication"] = raw_source_count
+    freshness_report["duplicate_captures_removed"] = raw_source_count - freshness_report["input_items"]
+    event_db = event_db or output_root.resolve().parent / ".local-refresh" / f"events-{output_root.name}.sqlite3"
+    historical_events = []
     if not skip_daily:
-        render_daily(events, dates, latest_date, output_root, daily_top)
-    render_timeline(events, output_root)
+        from site_daily_archive import backfill_events
+        historical_events = backfill_events(output_root, event_db)
+    clustering_stats = {}
+    identity_aliases = {}
+    home_events = cluster_home_events(home_items, registry_path=event_db, stats=clustering_stats, aliases=identity_aliases)
+    freshness_report["event_registry"] = clustering_stats
+    freshness_report["clustered_events"] = len(home_events)
+    freshness_report["displayed_domain_events"] = sum(event.category in HOME_CATEGORY_ORDER for event in home_events)
+    freshness_report["outside_domain_events"] = sum(event.category not in HOME_CATEGORY_ORDER for event in home_events)
+    freshness_report["merged_reports"] = len(home_items) - len(home_events)
+    write_json(output_root / "freshness" / "report.json", freshness_report)
+    shared_snapshot = home_event_snapshot(home_events, len(home_items), clustering_stats, identity_aliases, freshness_report)
+    if refresh_job_id:
+        shared_snapshot['refresh'] = {'job_id':refresh_job_id, 'stage':refresh_stage}
+    write_json(output_root / "source-pool" / "home-events.json", shared_snapshot)
+    # Both interactive stages and scheduled generation publish the same daily.
+    # Never invoke the legacy broad military/international daily or timeline.
+    if not skip_daily:
+        render_site_daily([*historical_events, *home_events], output_root, daily_top,
+                          registry_path=event_db, aliases=identity_aliases)
+    retire_timeline(output_root)
+    if current_pages_only:
+        render_home(home_events, latest_date, output_root, home_top, freshness_report)
+        render_source_hotlists(output_root, latest_date)
+        from weibo_page import render_weibo_page
+        render_weibo_page(output_root)
+        print(f"[current-pages] generated classified home, seven-sector daily and source pages for {latest_date}")
+        return
+    preserve_raw_latest(output_root)
+    render_home(home_events, latest_date, output_root, home_top, freshness_report)
     render_source_hotlists(output_root, latest_date)
+    from weibo_page import render_weibo_page
+    render_weibo_page(output_root)
     daily_status = "skipped" if skip_daily else str(daily_top)
-    print(f"[curated] generated home=all:{len(home_events)}, daily={daily_status}, events={len(events)}, dates={len(dates)}")
+    print(f"[curated] generated home=all:{len(home_events)}, seven-sector daily={daily_status}, dates={len(dates)}")
 
 
 def main() -> None:
@@ -2087,8 +2617,17 @@ def main() -> None:
     parser.add_argument("--daily-top", type=int, default=50)
     parser.add_argument("--skip-daily", action="store_true", help="Do not overwrite /daily/ pages")
     parser.add_argument("--hotlists-only", action="store_true", help="Only regenerate the styled source hotlist page")
+    parser.add_argument("--current-pages-only", action="store_true", help="Regenerate current home, seven-sector daily and source pages; preserve dated historical archives")
+    parser.add_argument("--event-db", type=Path, help="Private persistent registry outside the published output directory")
+    parser.add_argument("--cached-only", action="store_true", help="Replay saved data without fetching original publication metadata")
+    parser.add_argument("--refresh-job-id")
+    parser.add_argument("--refresh-stage", choices=('public','final'))
     args = parser.parse_args()
-    generate(Path(args.output_root), args.lookback_days, args.home_top, args.daily_top, args.skip_daily, args.hotlists_only)
+    if args.hotlists_only and args.current_pages_only:
+        parser.error("--hotlists-only and --current-pages-only are mutually exclusive")
+    if args.event_db and Path(args.output_root).resolve() in args.event_db.resolve().parents:
+        parser.error("--event-db must be outside the published output directory")
+    generate(Path(args.output_root), args.lookback_days, args.home_top, args.daily_top, args.skip_daily, args.hotlists_only, args.current_pages_only, args.event_db, args.cached_only, args.refresh_job_id, args.refresh_stage)
 
 
 if __name__ == "__main__":

@@ -245,7 +245,6 @@ def nav_html() -> str:
     nav = [
         ("home", "/", "领域分类"),
         ("daily", "/daily/", "日报"),
-        ("timeline", "/timeline/", "热点脉络"),
         ("raw", "/hotlists/", "来源热榜"),
     ]
     return "".join(
@@ -311,9 +310,13 @@ def render_page(items: list[TelegraphItem], generated_at: datetime, errors: list
       white-space: nowrap;
     }}
     nav a.active {{ color: #fff; background: #20293a; border-color: #20293a; }}
-    .page-head {{ margin: 24px 0 18px; }}
+    .page-head {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin: 24px 0 18px; }}
     h1 {{ margin: 0; font-size: 28px; line-height: 1.2; letter-spacing: 0; }}
     .sub {{ margin-top: 8px; color: var(--muted); line-height: 1.7; font-size: 14px; }}
+    .refresh-control {{ flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }}
+    .refresh-btn {{ min-height: 38px; padding: 8px 12px; border: 1px solid #176b87; border-radius: 6px; background: #fff; color: #176b87; font-weight: 750; cursor: pointer; }}
+    .refresh-btn.refreshing {{ opacity: .72; cursor: wait; }}
+    .refresh-status {{ min-height: 18px; color: var(--muted); font-size: 12px; line-height: 1.5; text-align: right; }}
     .summary {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 20px; }}
     .summary-cell {{ padding: 12px; background: #fff; border: 1px solid var(--line); border-radius: 8px; }}
     .summary-cell strong {{ display: block; font-size: 21px; line-height: 1.1; font-variant-numeric: tabular-nums; }}
@@ -336,6 +339,9 @@ def render_page(items: list[TelegraphItem], generated_at: datetime, errors: list
     @media (max-width: 860px) {{
       .topbar {{ position: static; align-items: flex-start; flex-direction: column; }}
       nav {{ width: 100%; overflow-x: auto; flex-wrap: nowrap; padding-bottom: 2px; justify-content: flex-start; }}
+      .page-head {{ flex-direction: column; }}
+      .refresh-control {{ width: 100%; align-items: flex-start; }}
+      .refresh-status {{ text-align: left; }}
       .summary {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .telegraph-item {{ grid-template-columns: 54px minmax(0, 1fr); gap: 8px; }}
       .timebox {{ position: static; padding-top: 12px; }}
@@ -352,18 +358,130 @@ def render_page(items: list[TelegraphItem], generated_at: datetime, errors: list
       <nav><a class="back-link" href="/" onclick="history.back(); return false;">返回</a>{nav_html()}</nav>
     </div>
     <div class="page-head">
-      <h1>财联社电报</h1>
-      <div class="sub">{e(latest_date)} · 来源热榜 / 财联社电报 · 按财联社发布时间倒序展示，不做热度、主题或平台权重排序。</div>
+      <div>
+        <h1>财联社电报</h1>
+        <div class="sub">{e(latest_date)} · 来源热榜 / 财联社电报 · 按财联社发布时间倒序展示；点击刷新可实时抓取，不做热度、主题或平台权重排序。</div>
+      </div>
+      <div class="refresh-control">
+        <button class="refresh-btn" id="cls-refresh" type="button">刷新财联社 <span>实时</span></button>
+        <div class="refresh-status" id="cls-refresh-status" aria-live="polite"></div>
+      </div>
     </div>
     <div class="summary">
-      <div class="summary-cell"><strong>{len(items)}</strong><span>电报条目</span></div>
-      <div class="summary-cell"><strong>{e(latest)}</strong><span>最新时间</span></div>
-      <div class="summary-cell"><strong>{e(earliest)}</strong><span>最早时间</span></div>
-      <div class="summary-cell"><strong>{e(generated_at.strftime("%H:%M:%S"))}</strong><span>生成时间</span></div>
+      <div class="summary-cell"><strong id="cls-count">{len(items)}</strong><span>电报条目</span></div>
+      <div class="summary-cell"><strong id="cls-latest">{e(latest)}</strong><span>最新时间</span></div>
+      <div class="summary-cell"><strong id="cls-earliest">{e(earliest)}</strong><span>最早时间</span></div>
+      <div class="summary-cell"><strong id="cls-generated">{e(generated_at.strftime("%H:%M:%S"))}</strong><span>生成时间</span></div>
     </div>
-    {error_html}
-    <main>{''.join(rows) if rows else '<div class="empty">暂时没有抓到财联社电报。</div>'}</main>
+    <div id="cls-notice">{error_html}</div>
+    <main id="telegraph-list">{''.join(rows) if rows else '<div class="empty">暂时没有抓到财联社电报。</div>'}</main>
   </div>
+  <script>
+    const clsRefresh = document.getElementById('cls-refresh');
+    const clsStatus = document.getElementById('cls-refresh-status');
+    const clsList = document.getElementById('telegraph-list');
+    const clsNotice = document.getElementById('cls-notice');
+    const clsCount = document.getElementById('cls-count');
+    const clsLatest = document.getElementById('cls-latest');
+    const clsEarliest = document.getElementById('cls-earliest');
+    const clsGenerated = document.getElementById('cls-generated');
+
+    function escapeHtml(value) {{
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }}
+
+    function safeClass(value) {{
+      return String(value ?? '').toLowerCase().replace(/[^a-z0-9_-]/g, '');
+    }}
+
+    function renderLiveTags(item) {{
+      const level = String(item.level || '');
+      const subjects = Array.isArray(item.subjects) ? item.subjects : [];
+      const stocks = Array.isArray(item.stocks) ? item.stocks : [];
+      const tags = [];
+      if (level) tags.push('<span class="mini-chip level level-' + safeClass(level) + '">' + escapeHtml(level) + '</span>');
+      subjects.forEach(label => tags.push('<span class="mini-chip">' + escapeHtml(label) + '</span>'));
+      stocks.forEach(label => tags.push('<span class="mini-chip stock">' + escapeHtml(label) + '</span>'));
+      return tags.join('');
+    }}
+
+    function renderLiveItem(item) {{
+      const time = String(item.time || '');
+      const clock = time.slice(11, 19) || '--:--:--';
+      const author = item.author ? ' · ' + escapeHtml(item.author) : '';
+      const content = item.content ? '<p>' + escapeHtml(item.content) + '</p>' : '';
+      return [
+        '<article class="telegraph-item" data-telegraph-id="' + escapeHtml(item.id || '') + '">',
+        '  <div class="timebox"><strong>' + escapeHtml(clock.slice(0, 5)) + '</strong><span>' + escapeHtml(clock.slice(6, 8)) + '</span></div>',
+        '  <div class="telegraph-card">',
+        '    <div class="telegraph-meta">' + escapeHtml(time) + author + '</div>',
+        '    <h2><a href="' + escapeHtml(item.url || 'https://www.cls.cn/telegraph') + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(item.title || '') + '</a></h2>',
+        '    ' + content,
+        '    <div class="row-tags">' + renderLiveTags(item) + '</div>',
+        '  </div>',
+        '</article>'
+      ].join('');
+    }}
+
+    function formatGeneratedAt(value) {{
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return '--:--:--';
+      return new Intl.DateTimeFormat('zh-CN', {{
+        timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+      }}).format(date);
+    }}
+
+    function replaceTelegraphItems(items, generatedAt) {{
+      const rows = [];
+      let currentDate = '';
+      items.forEach(item => {{
+        const dateLabel = String(item.time || '').slice(0, 10) || '未知日期';
+        if (dateLabel !== currentDate) {{
+          rows.push('<div class="date-row">' + escapeHtml(dateLabel) + '</div>');
+          currentDate = dateLabel;
+        }}
+        rows.push(renderLiveItem(item));
+      }});
+      clsList.innerHTML = rows.length ? rows.join('') : '<div class="empty">暂时没有抓到财联社电报。</div>';
+      const latest = items[0] ? String(items[0].time || '').slice(11, 19) : '-';
+      const earliest = items.length ? String(items[items.length - 1].time || '').slice(11, 19) : '-';
+      clsCount.textContent = String(items.length);
+      clsLatest.textContent = latest || '-';
+      clsEarliest.textContent = earliest || '-';
+      clsGenerated.textContent = formatGeneratedAt(generatedAt);
+      clsNotice.innerHTML = '';
+    }}
+
+    async function refreshClsTelegraph() {{
+      if (!clsRefresh) return;
+      clsRefresh.disabled = true;
+      clsRefresh.classList.add('refreshing');
+      clsStatus.textContent = '财联社刷新中...';
+      try {{
+        const response = await fetch('/api/cls/telegraph?refresh=1&limit=120&pages=8&page_size=20&ts=' + Date.now(), {{ cache: 'no-store' }});
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const payload = await response.json();
+        if (!payload.ok) throw new Error(payload.error || '刷新失败');
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        replaceTelegraphItems(items, payload.generated_at);
+        const latest = items[0] ? String(items[0].time || '').slice(11, 19) : '--:--:--';
+        const partial = Array.isArray(payload.errors) && payload.errors.length ? '，部分翻页失败' : '';
+        clsStatus.textContent = '财联社已更新至 ' + latest + '，共 ' + items.length + ' 条' + partial;
+      }} catch (error) {{
+        clsStatus.textContent = '财联社刷新失败：' + (error.message || String(error));
+      }} finally {{
+        clsRefresh.disabled = false;
+        clsRefresh.classList.remove('refreshing');
+      }}
+    }}
+
+    if (clsRefresh) clsRefresh.addEventListener('click', refreshClsTelegraph);
+  </script>
 </body>
 </html>
 """

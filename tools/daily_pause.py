@@ -72,7 +72,6 @@ def render_page(now: datetime) -> str:
     <nav>
       <a href="/curated/">领域分类</a>
       <a href="/hotlists/">来源热榜</a>
-      <a href="/timeline/">热点脉络</a>
       <a class="active" href="/daily/">日报</a>
     </nav>
     <section class="panel">

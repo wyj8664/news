@@ -6,3 +6,12 @@ __pycache__/
 cloudflare/worker/wrangler.toml
 node_modules/
 .wrangler/
+.hotlists-refresh.log
+.hotlists-refresh.err.log
+.local-hotlists-refresh.lock/
+.preview.log
+.preview.err.log
+.local-refresh/
+.refresh-service.log
+.refresh-service.err.log
+.site-deploy*/

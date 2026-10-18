@@ -1,0 +1,9 @@
+{
+  "job_cooldown_seconds": 600,
+  "public_source_cooldown_seconds": 600,
+  "weibo_wait_timeout_seconds": 1200,
+  "poll_seconds": 5,
+  "briefing_refresh_wait_seconds": 1800,
+  "automatic_cleanup_enabled": false,
+  "wechat_collection_enabled": false
+}

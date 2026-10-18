@@ -149,7 +149,6 @@ GLOBAL_NAV = f"""{GLOBAL_NAV_MARKER}
                 <a class="newshot-back-link" href="/" onclick="history.back(); return false;">返回</a>
                 <a href="/">领域分类</a>
                 <a href="/daily/">日报</a>
-                <a href="/timeline/">热点脉络</a>
                 <a class="active" href="/hotlists/">来源热榜</a>
             </nav>
         </div>"""

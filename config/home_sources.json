@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "trendradar": true,
+  "rss": true,
+  "weibo_followed": true,
+  "native_feeds": ["cls-telegraph", "jin10-all", "jiemian-flash"],
+  "wechat_collection_enabled": false,
+  "window_hours": 24,
+  "max_pages_per_feed": 24
+}

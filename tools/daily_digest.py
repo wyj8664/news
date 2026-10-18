@@ -386,7 +386,7 @@ def render_archive(entries: list[ArchiveEntry], active_date: str) -> str:
                 f'<span>{month_count}</span></div>'
             )
         active = " active" if entry.date == active_date else ""
-        title = html.escape(entry.title or "日报生成中")
+        title = html.escape(entry.title or "暂无日报内容")
         groups.append(
             f'<a class="archive-row{active}" href="/daily/{html.escape(entry.date)}.html">'
             f'<span class="day">{html.escape(day_label(entry.date))} 日</span>'
@@ -415,6 +415,8 @@ def render_html(
     generated_at: str,
     top: int,
     archive_entries: list[ArchiveEntry],
+    *, rows_html: str | None = None, subtitle: str | None = None,
+    main_attributes: str = "",
 ) -> str:
     rows = []
     for idx, cluster in enumerate(clusters[:top], 1):
@@ -439,6 +441,9 @@ def render_html(
             </article>
             """
         )
+    if rows_html is not None:
+        rows = [rows_html]
+    subtitle = subtitle if subtitle is not None else f"基于热榜排名、在榜次数、跨平台覆盖和 RSS 正式新闻源自动排序。生成时间：{generated_at}"
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -652,6 +657,7 @@ def render_html(
       padding: 18px 0;
       border-bottom: 1px solid var(--line);
     }}
+    .item .body {{ min-width: 0; overflow-wrap: anywhere; }}
     .rank {{
       width: 34px;
       height: 34px;
@@ -737,17 +743,16 @@ def render_html(
       <a class="back-link" href="/" onclick="history.back(); return false;">返回</a>
       <a href="/">领域分类</a>
       <a class="active" href="/daily/">日报</a>
-      <a href="/timeline/">热点脉络</a>
       <a href="/hotlists/">来源热榜</a>
     </nav>
   </div>
   <div class="shell">
     {render_archive(archive_entries, date)}
-    <main>
+    <main {main_attributes}>
       <header>
         <div>
           <h1>{html.escape(date)} 新闻日报 Top {top}</h1>
-          <div class="sub">基于热榜排名、在榜次数、跨平台覆盖和 RSS 正式新闻源自动排序。生成时间：{html.escape(generated_at)}</div>
+          <div class="sub">{html.escape(subtitle)}</div>
         </div>
       </header>
       {''.join(rows)}

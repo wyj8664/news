@@ -2,21 +2,26 @@ name: Deploy NEWSHOT to Cloudflare Pages
 
 on:
   workflow_dispatch:
+    inputs:
+      deploy_snapshot:
+        description: Deploy the approved local public snapshot without recollecting
+        type: boolean
+        default: false
   schedule:
     - cron: "17 */2 * * *"
 
 concurrency:
   group: cloudflare-pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CLOUDFLARE_PAGES_PROJECT: newshot
+  TZ: Asia/Shanghai
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,96 +31,114 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Prepare output directory
-        run: mkdir -p output
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Verify existing Pages target
+        run: python3 tools/public_site_bundle.py verify-target
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Restore approved public pages and seven-day archive
+        run: python3 tools/public_site_bundle.py restore --archive data/site-public-seed.tar.gz --output-root output
 
       - name: Restore generated history cache
+        if: ${{ !inputs.deploy_snapshot }}
         uses: actions/cache/restore@v4
         with:
           path: |
             output/news
             output/rss
             output/markets
+            output/weibo
+            output/freshness
+            output/source-pool
+            output/daily
+            .local-refresh/events-output.sqlite3
+            .local-refresh/site-daily-output
           key: newshot-history-${{ github.run_id }}
           restore-keys: |
             newshot-history-
 
-      - name: Restore seeded history
+      - name: Restore seeded upstream history
+        if: ${{ !inputs.deploy_snapshot }}
         run: |
           if [ -f data/history-seed.tar.gz ]; then
             tar -xzf data/history-seed.tar.gz -C output
           fi
 
-      - name: Validate history databases
+      - name: Validate upstream history databases
+        if: ${{ !inputs.deploy_snapshot }}
         run: |
           python3 - <<'PY'
           from pathlib import Path
-
-          for folder in ("output/news", "output/rss"):
-              for path in Path(folder).glob("*.db"):
-                  try:
-                      header = path.read_bytes()[:16]
-                  except OSError:
-                      continue
-                  if header != b"SQLite format 3\x00":
-                      print(f"Removing invalid history file: {path}")
+          for folder in ('output/news', 'output/rss'):
+              for path in Path(folder).glob('*.db'):
+                  with path.open('rb') as handle:
+                      valid = handle.read(16) == b'SQLite format 3\x00'
+                  if not valid:
                       path.unlink()
           PY
 
+      - name: Seed stable identities from already-public snapshots only
+        if: ${{ !inputs.deploy_snapshot }}
+        run: python3 tools/seed_event_registry.py --output-root output
+
       - name: Run upstream TrendRadar crawler
+        if: ${{ !inputs.deploy_snapshot }}
         run: >-
-          docker run --rm
-          --entrypoint python
-          -e TZ=Asia/Shanghai
-          -e DOCKER_CONTAINER=true
-          -e SCHEDULE_ENABLED=false
-          -e AI_ANALYSIS_ENABLED=false
-          -e AI_TRANSLATION_ENABLED=false
-          -e STORAGE_TXT_ENABLED=true
-          -e STORAGE_HTML_ENABLED=true
-          -v "$PWD/config:/app/config:ro"
-          -v "$PWD/output:/app/output"
-          wantcat/trendradar:latest
-          manage.py run
+          docker run --rm --entrypoint python
+          -e TZ=Asia/Shanghai -e DOCKER_CONTAINER=true
+          -e SCHEDULE_ENABLED=false -e AI_ANALYSIS_ENABLED=false
+          -e AI_TRANSLATION_ENABLED=false -e STORAGE_TXT_ENABLED=true
+          -e STORAGE_HTML_ENABLED=false
+          -v "$PWD/config:/app/config:ro" -v "$PWD/output:/app/output"
+          wantcat/trendradar:latest manage.py run
 
       - name: Fix generated file ownership
+        if: ${{ !inputs.deploy_snapshot }}
         run: sudo chown -R "$USER:$USER" output
 
       - name: Generate market quotes
+        if: ${{ !inputs.deploy_snapshot }}
         run: python3 tools/market_quotes.py --output-root output --watchlist config/market_watchlist.json
 
-      - name: Generate CLS telegraph page
-        run: python3 tools/cls_telegraph.py --output-root output --limit 120 --pages 8
+      - name: Refresh public native news streams
+        if: ${{ !inputs.deploy_snapshot }}
+        run: python3 tools/home_source_pool.py --output-root output
 
-      - name: Generate curated pages
-        run: python3 tools/curated_events.py --output-root output --lookback-days 7 --home-top 24 --daily-top 50 --skip-daily
+      - name: Load followed public Weibo snapshot
+        if: ${{ !inputs.deploy_snapshot }}
+        run: python3 tools/weibo_feed.py --from-public --allow-stale --output-root output
 
-      - name: Generate daily paused page
-        run: python3 tools/daily_pause.py --output-root output
+      - name: Generate classified homepage, seven-sector daily and source pages
+        if: ${{ !inputs.deploy_snapshot }}
+        run: python3 tools/curated_events.py --output-root output --lookback-days 7 --home-top 24 --daily-top 50
 
-      - name: Add Cloudflare Pages headers
-        run: |
-          cp cloudflare/pages/_headers output/_headers
-          cp cloudflare/pages/_worker.js output/_worker.js
-
-      - name: Save generated history cache
-        if: always()
+      - name: Save private generated history cache
+        if: ${{ always() && !inputs.deploy_snapshot }}
         uses: actions/cache/save@v4
         with:
           path: |
             output/news
             output/rss
             output/markets
+            output/weibo
+            output/freshness
+            output/source-pool
+            output/daily
+            .local-refresh/events-output.sqlite3
+            .local-refresh/site-daily-output
           key: newshot-history-${{ github.run_id }}
 
-      - name: Ensure Cloudflare Pages project exists
-        run: npx wrangler pages project create "$CLOUDFLARE_PAGES_PROJECT" --production-branch main || true
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      - name: Build public-only deployment directory
+        run: python3 tools/public_site_bundle.py pack --output-root output --destination .site-deploy-dist
 
-      - name: Deploy to Cloudflare Pages
-        run: npx wrangler pages deploy output --project-name "$CLOUDFLARE_PAGES_PROJECT"
+      - name: Deploy to existing Cloudflare Pages project
+        run: npx --yes wrangler@4.151.1 pages deploy .site-deploy-dist --project-name "$CLOUDFLARE_PAGES_PROJECT" --branch main
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
