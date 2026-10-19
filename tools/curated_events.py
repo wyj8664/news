@@ -28,6 +28,7 @@ from event_registry import EventRegistry, Progress as HomeProgress, TYPE_LABELS,
 from home_categories import CATEGORY_ORDER as HOME_CATEGORY_ORDER, category_label as home_category_label, classify_event as classify_home_event
 from jin10_public import public_jin10_record
 from jiemian_flash import SOURCE_ID as JIEMIAN_SOURCE_ID, SOURCE_NAME as JIEMIAN_SOURCE_NAME, LIST_URL as JIEMIAN_LIST_URL
+from news_ranking import POLICY as RANKING_POLICY, rank_progress, card_rank, sort_key, epoch_millis
 
 DAILY_CATEGORY_ORDER = tuple(key for key in HOME_CATEGORY_ORDER if key != "society")
 
@@ -938,7 +939,7 @@ def load_jin10_source_items(output_root: Path, limit: int = 2000) -> tuple[list[
                    "errors": snapshot.get("errors", []), "skipped_restricted": snapshot.get("skipped_restricted", 0)}
 
 
-def load_weibo_items(output_root: Path) -> list[RawItem]:
+def load_weibo_items(output_root: Path, *, window_hours: float = 24) -> list[RawItem]:
     snapshot = output_root / "weibo" / "latest.json"
     if not snapshot.exists():
         return []
@@ -949,7 +950,7 @@ def load_weibo_items(output_root: Path) -> list[RawItem]:
     allowed = {str(account.get("id", "")) for account in payload.get("accounts", [])}
     collected = parse_publication_time(payload.get("fetched_at"))
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
-    cutoff = now.timestamp() * 1000 - 24 * 3600 * 1000
+    cutoff = now.timestamp() * 1000 - window_hours * 3600 * 1000
     items = []
     for post in payload.get("items", []):
         if str(post.get("account_id", "")) not in allowed:
@@ -1066,10 +1067,10 @@ def cluster_home_events(items: list[RawItem], *, registry_path: Path | None = No
     return sorted(events, key=lambda event: (event.score, event.last_dt), reverse=True)
 
 
-def current_event_view(event: Event, cutoff: datetime) -> Event | None:
+def current_event_view(event: Event, cutoff: datetime, *, now: datetime | None = None) -> Event | None:
     """Filter visibility, not identity; a later duplicate cannot revive an old node."""
     recent = [item for item in event.items if item.published_dt is not None and item.publication_source
-              and cutoff <= china_time(item.published_dt) <= datetime.now(CHINA) + timedelta(minutes=5)]
+              and cutoff <= china_time(item.published_dt) <= (now or datetime.now(CHINA)) + timedelta(minutes=5)]
     progresses = []
     if event.progresses:
         allowed = {item.doc_id or document_id(item) for item in recent}
@@ -1090,6 +1091,43 @@ def current_event_view(event: Event, cutoff: datetime) -> Event | None:
     view.title = clean_headline(home_representative(recent))
     view.category = classify_home_event(view.title, recent)
     return view
+
+
+def event_progress_ranking(event: Event, now: datetime) -> list[dict]:
+    """Score each factual node using only its own independent publishers.
+
+    The legacy importance score remains untouched for historical daily archives.
+    Capture count/date/recency cannot increase this live importance score.
+    """
+    nodes = event.progresses or [HomeProgress(event.key, event.key, event.title, 'report',
+        min(china_time(item.published_dt) for item in event.items), event.items,
+        [item.doc_id or document_id(item) for item in event.items])]
+    result = []
+    for node in nodes:
+        first = china_time(node.first_reported_at).replace(tzinfo=None)
+        publishers = {}
+        for item in node.items:
+            normalized = replace(item, count=1, date=first.strftime('%Y-%m-%d'),
+                first_dt=first, last_dt=first, collected_dt=first,
+                score=item_score(item.title, item.source_weight, 1, item.best_rank, item.source_trust))
+            publisher = publisher_id(item)
+            if publisher not in publishers or display_score(normalized) > display_score(publishers[publisher]):
+                publishers[publisher] = normalized
+        if not publishers:
+            continue
+        temporary = Event(key=event.key)
+        for item in publishers.values():
+            temporary.add(item)
+        temporary.source_ids = set(publishers)
+        finalize_event(temporary)
+        result.append({'id': node.key, **rank_progress(temporary.score, node.first_reported_at, now)})
+    return result
+
+
+def live_event_sort_key(event: Event, now: datetime):
+    ranking = event_progress_ranking(event, now)
+    latest = max(node['first_reported_at'] for node in ranking)
+    return sort_key(card_rank(ranking), latest, event.key)
 
 
 def match_topic(text: str) -> str | None:
@@ -1581,7 +1619,11 @@ def event_card(event: Event, rank: int | None = None, compact: bool = False) -> 
 
 
 def home_event_row(event: Event, rank: int, *, dynamic: bool = True,
-                   allowed_categories: tuple[str, ...] | None = None) -> str:
+                   allowed_categories: tuple[str, ...] | None = None,
+                   ranking_now: datetime | None = None) -> str:
+    ranking_now = ranking_now or datetime.now(CHINA)
+    ranking = event_progress_ranking(event, ranking_now)
+    ranking_score = card_rank(ranking)
     title = e(event.title)
     primary_url = safe_link(event.url)
     title_html = f'<a href="{e(primary_url)}" target="_blank" rel="noopener noreferrer">{title}</a>' if primary_url else title
@@ -1593,7 +1635,8 @@ def home_event_row(event: Event, rank: int, *, dynamic: bool = True,
     publish_label = first if first == last else f"{first} — {last}"
     captures = [china_time(item.collected_dt) for item in event.items if item.collected_dt is not None]
     capture_label = max(captures).strftime("%m-%d %H:%M") if captures else "未提供"
-    expires_ms = int((min(published) + timedelta(hours=WINDOW_HOURS)).timestamp() * 1000)
+    boundaries = sorted(set(published))
+    expires_ms = int((boundaries[0] + timedelta(hours=WINDOW_HOURS)).timestamp() * 1000)
     source_counts = {}
     for item in event.items:
         name = publisher_name(item)
@@ -1602,8 +1645,8 @@ def home_event_row(event: Event, rank: int, *, dynamic: bool = True,
     related_items = sorted(event.items, key=lambda item: (item.published_dt, item.source_trust), reverse=True)
     nodes = []
     progresses = sorted(event.progresses, key=lambda progress: (progress.first_reported_at, progress.key), reverse=True)
-    last_progress_ms = int(max((china_time(progress.first_reported_at) for progress in progresses),
-                              default=max(published)).timestamp() * 1000)
+    last_progress_ms = epoch_millis(max((china_time(progress.first_reported_at) for progress in progresses),
+                              default=max(published)))
     for progress in progresses:
         related = "".join(
             f'<li data-doc-id="{e(item.doc_id or document_id(item))}"><a href="{e(safe_link(item.url))}" target="_blank" rel="noopener noreferrer">{e(item.title)}</a>'
@@ -1629,17 +1672,17 @@ def home_event_row(event: Event, rank: int, *, dynamic: bool = True,
         tags.append(f'<span class="mini-chip">{e(event.status)}</span>')
     future_states = []
     if dynamic:
-        for boundary in sorted(set(published))[:-1]:
-            remaining = [item for item in event.items if china_time(item.published_dt) > boundary]
-            future = current_event_view(event, boundary + timedelta(microseconds=1))
+        for boundary in boundaries[:-1]:
+            future = current_event_view(event, boundary + timedelta(microseconds=1), now=ranking_now)
             if future is None:
                 continue
-            until = int((min(china_time(item.published_dt) for item in remaining) + timedelta(hours=WINDOW_HOURS)).timestamp() * 1000)
+            future_bounds = [china_time(item.published_dt) for item in future.items]
+            until = int((min(future_bounds) + timedelta(hours=WINDOW_HOURS)).timestamp() * 1000)
             allowed = allowed_categories is None or future.category in allowed_categories
             future_states.append({"until": until, "html": home_event_row(future, rank, dynamic=False,
-                                  allowed_categories=allowed_categories) if allowed else ""})
+                                  allowed_categories=allowed_categories, ranking_now=ranking_now) if allowed else ""})
     return f"""
-    <article class="classified-row" data-event-id="{e(event.key)}" data-progress-ids="{e(json.dumps([progress.key for progress in progresses]))}" data-progress-count="{len(progresses) or 1}" data-doc-ids="{e(json.dumps([item.doc_id or document_id(item) for item in event.items]))}" data-category="{e(event.category)}" data-score="{event.score:.1f}" data-last-progress-at="{last_progress_ms}" data-expires-at="{expires_ms}" data-future-states="{e(json.dumps(future_states, ensure_ascii=False))}" data-item-count="{len(event.items)}" data-source-counts="{e(json.dumps(source_counts, ensure_ascii=False))}">
+    <article class="classified-row" data-event-id="{e(event.key)}" data-progress-ids="{e(json.dumps([progress.key for progress in progresses]))}" data-progress-count="{len(progresses) or 1}" data-doc-ids="{e(json.dumps([item.doc_id or document_id(item) for item in event.items]))}" data-category="{e(event.category)}" data-score="{ranking_score:.8f}" data-ranking-progresses="{e(json.dumps(ranking, ensure_ascii=False))}" data-last-progress-at="{last_progress_ms}" data-expires-at="{expires_ms}" data-future-states="{e(json.dumps(future_states, ensure_ascii=False))}" data-item-count="{len(event.items)}" data-source-counts="{e(json.dumps(source_counts, ensure_ascii=False))}">
       <div class="row-rank">#{rank}</div>
       <div>
         <h3>{title_html}</h3>
@@ -1789,15 +1832,17 @@ def market_watch_html() -> str:
     """
 
 
-def render_home(events: list[Event], latest_date: str, output_root: Path, top: int, freshness_report: dict | None = None) -> None:
+def render_home(events: list[Event], latest_date: str, output_root: Path, top: int, freshness_report: dict | None = None,
+                *, now: datetime | None = None) -> None:
     from home_refresh import markup as refresh_markup
-    now = datetime.now(CHINA)
+    now = china_time(now or datetime.now(CHINA))
     cutoff = now - timedelta(hours=WINDOW_HOURS)
     # Protect direct callers and a build crossing the publication cutoff boundary.
     # The registry already assigned identities. Rendering/expiry must not recluster
     # in memory and silently replace stable IDs with a different set of IDs.
-    today_events = [view for event in events if (view := current_event_view(event, cutoff))
+    today_events = [view for event in events if (view := current_event_view(event, cutoff, now=now))
                     and view.category in HOME_CATEGORY_ORDER]
+    today_events.sort(key=lambda event: live_event_sort_key(event, now))
     category_groups: dict[str, list[Event]] = {category: [] for category in HOME_CATEGORY_ORDER}
     for event in today_events:
         if event.category in category_groups:
@@ -1821,7 +1866,7 @@ def render_home(events: list[Event], latest_date: str, output_root: Path, top: i
         )
 
     sections = []
-    all_rows = "\n".join(home_event_row(event, idx + 1) for idx, event in enumerate(today_events))
+    all_rows = "\n".join(home_event_row(event, idx + 1, ranking_now=now) for idx, event in enumerate(today_events))
     sections.append(
         f"""
         <section class="category-section" data-category-section="all">
@@ -1835,7 +1880,7 @@ def render_home(events: list[Event], latest_date: str, output_root: Path, top: i
     )
     for category in HOME_CATEGORY_ORDER:
         group = category_groups.get(category, [])
-        rows = "\n".join(home_event_row(event, idx + 1) for idx, event in enumerate(group))
+        rows = "\n".join(home_event_row(event, idx + 1, ranking_now=now) for idx, event in enumerate(group))
         sections.append(
             f"""
             <section class="category-section" data-category-section="{e(category)}">
@@ -1881,8 +1926,10 @@ def render_home(events: list[Event], latest_date: str, output_root: Path, top: i
         </section>
       </aside>
     </div>
+    <script>{Path(__file__).with_name('news_ranking.js').read_text()}</script>
     <script>
       const list = document.getElementById('event-list');
+      const homeRankingPolicy = {json.dumps(RANKING_POLICY)};
       const buttons = Array.from(document.querySelectorAll('#category-controls button[data-category]'));
       let selectedCategory = 'all';
       function applyCategory(name) {{
@@ -1913,25 +1960,40 @@ def render_home(events: list[Event], latest_date: str, output_root: Path, top: i
             const template = document.createElement('template');
             template.innerHTML = next.html.trim();
             const replacement = template.content.firstElementChild;
-            if (!buttons.some(button => button.dataset.category === replacement.dataset.category)) {{ row.remove(); return; }}
+            if (!replacement || !buttons.some(button => button.dataset.category === replacement.dataset.category)) {{ row.remove(); return; }}
             replacement.dataset.futureStates = JSON.stringify(states.filter(state => state.until > next.until));
             const open = row.querySelector('details')?.open;
             if (open && replacement.querySelector('details')) replacement.querySelector('details').open = true;
             row.replaceWith(replacement);
           }}
         }});
-        const allRows = Array.from(allList.querySelectorAll('.classified-row')).sort((a,b) => Number(b.dataset.score) - Number(a.dataset.score));
-        allRows.forEach((row,index) => {{ row.querySelector('.row-rank').textContent = '#' + (index + 1); allList.append(row); }});
+        function rankRows(container) {{
+          const rows = Array.from(container.querySelectorAll('.classified-row'));
+          rows.forEach(row => {{
+            const nodes = JSON.parse(row.dataset.rankingProgresses || '[]');
+            row.dataset.score = String(NEWSHOT_RANKING.card(nodes, now, homeRankingPolicy));
+          }});
+          rows.sort((a,b) => NEWSHOT_RANKING.compare(
+            {{score:Number(a.dataset.score), first:Number(a.dataset.lastProgressAt), id:a.dataset.eventId}},
+            {{score:Number(b.dataset.score), first:Number(b.dataset.lastProgressAt), id:b.dataset.eventId}}));
+          rows.forEach((row,index) => {{ row.querySelector('.row-rank').textContent = '#' + (index + 1); container.append(row); }});
+          return rows;
+        }}
+        const allRows = rankRows(allList);
         if (changed) {{
           list.querySelectorAll('.category-section').forEach(section => {{
             const category = section.dataset.categorySection;
             if (category === 'all') return;
+            const opened = new Set(Array.from(section.querySelectorAll('.classified-row')).filter(row => row.querySelector('details')?.open).map(row => row.dataset.eventId));
             const copies = allRows.filter(row => row.dataset.category === category).map((row,index) => {{
-              const copy = row.cloneNode(true); copy.querySelector('.row-rank').textContent = '#' + (index + 1); return copy;
+              const copy = row.cloneNode(true); copy.querySelector('.row-rank').textContent = '#' + (index + 1);
+              if (opened.has(copy.dataset.eventId) && copy.querySelector('details')) copy.querySelector('details').open = true;
+              return copy;
             }});
             section.querySelector('.classified-list').replaceChildren(...copies);
           }});
         }}
+        list.querySelectorAll('.category-section:not([data-category-section="all"]) .classified-list').forEach(rankRows);
         const counts = Object.assign(Object.create(null), {{all:allRows.length}});
         const sources = Object.create(null);
         let itemCount = 0;
@@ -2490,23 +2552,30 @@ def preserve_raw_latest(output_root: Path) -> None:
 
 
 def home_event_snapshot(events: list[Event], source_records: int, stats: dict, aliases: dict,
-                        freshness_report: dict, *, now: datetime | None = None) -> dict:
+                        freshness_report: dict, *, now: datetime | None = None,
+                        window_start: datetime | None = None) -> dict:
     """One published contract for the homepage and Feishu; never recluster here."""
     now = now or datetime.now(CHINA)
-    views = [view for event in events if (view := current_event_view(event, now - timedelta(hours=WINDOW_HOURS)))]
+    cutoff = window_start or now - timedelta(hours=WINDOW_HOURS)
+    views = [view for event in events if (view := current_event_view(event, cutoff, now=now))]
+    views.sort(key=lambda event: live_event_sort_key(event, now))
+    rankings = {event.key:{node['id']:node for node in event_progress_ranking(event, now)} for event in views}
     return {
         "schema_version": 3, "model": "event-progress-doc", "pipeline": "shared-home-v1",
-        "generated_at": now.isoformat(), "source_records": source_records,
+        "generated_at": now.isoformat(), "source_records": source_records, "ranking_policy": RANKING_POLICY,
         "categories": [{"id": key, "name": home_category_label(key)} for key in HOME_CATEGORY_ORDER],
         "clustering": stats, "id_aliases": aliases,
         "source_status": freshness_report.get("native_sources", []),
         "events": [{
-            "id": event.key, "title": event.title, "url": event.url, "score": event.score,
+            "id": event.key, "title": event.title, "url": event.url,
+            "importance_score": max((node['importance_score'] for node in rankings[event.key].values()), default=0),
+            "score": card_rank(rankings[event.key].values()),
             "category": event.category, "displayed_on_home": event.category in HOME_CATEGORY_ORDER,
             "source_count": event.source_count,
             "progresses": [{
                 "id": progress.key, "event_id": event.key, "title": progress.title,
                 "type": progress.kind, "first_reported_at": china_time(progress.first_reported_at).isoformat(),
+                **{name:rankings[event.key][progress.key][name] for name in ('importance_score','score','decay_factor')},
                 "doc_ids": progress.doc_ids,
                 "representative_doc_id": home_representative(progress.items).doc_id,
                 "representative_url": home_representative(progress.items).url,
@@ -2583,7 +2652,8 @@ def generate(
     freshness_report["outside_domain_events"] = sum(event.category not in HOME_CATEGORY_ORDER for event in home_events)
     freshness_report["merged_reports"] = len(home_items) - len(home_events)
     write_json(output_root / "freshness" / "report.json", freshness_report)
-    shared_snapshot = home_event_snapshot(home_events, len(home_items), clustering_stats, identity_aliases, freshness_report)
+    generation_now = datetime.now(CHINA)
+    shared_snapshot = home_event_snapshot(home_events, len(home_items), clustering_stats, identity_aliases, freshness_report, now=generation_now)
     if refresh_job_id:
         shared_snapshot['refresh'] = {'job_id':refresh_job_id, 'stage':refresh_stage}
     write_json(output_root / "source-pool" / "home-events.json", shared_snapshot)
@@ -2594,14 +2664,14 @@ def generate(
                           registry_path=event_db, aliases=identity_aliases)
     retire_timeline(output_root)
     if current_pages_only:
-        render_home(home_events, latest_date, output_root, home_top, freshness_report)
+        render_home(home_events, latest_date, output_root, home_top, freshness_report, now=generation_now)
         render_source_hotlists(output_root, latest_date)
         from weibo_page import render_weibo_page
         render_weibo_page(output_root)
         print(f"[current-pages] generated classified home, seven-sector daily and source pages for {latest_date}")
         return
     preserve_raw_latest(output_root)
-    render_home(home_events, latest_date, output_root, home_top, freshness_report)
+    render_home(home_events, latest_date, output_root, home_top, freshness_report, now=generation_now)
     render_source_hotlists(output_root, latest_date)
     from weibo_page import render_weibo_page
     render_weibo_page(output_root)

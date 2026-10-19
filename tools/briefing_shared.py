@@ -19,6 +19,8 @@ from event_registry import statements, same_progress
 from home_categories import CATEGORY_LABELS, CATEGORY_ORDER
 from news_event_clustering import article_url, normalize
 from news_freshness import CHINA, parse_publication_time, write_json
+from briefing_window import delivery_window
+from news_ranking import POLICY as RANKING_POLICY, rank_snapshot_progress
 
 PIPELINE = "shared-home-v1"
 ROOT = Path(__file__).resolve().parents[1]
@@ -114,6 +116,8 @@ def legacy_matches(snapshot, history):
 def validate_snapshot(snapshot, now, *, max_age_hours=2):
     if snapshot.get("schema_version") != 3 or snapshot.get("pipeline") != PIPELINE:
         raise ValueError("网站事件快照需要由当前版本重新生成；日报不会退回旧采集器。")
+    if 'ranking_policy' in snapshot and snapshot['ranking_policy'] != RANKING_POLICY:
+        raise ValueError('未知排序规则，停止发送。')
     generated = parse_publication_time(snapshot.get("generated_at"))
     if not generated or generated > now + timedelta(minutes=5) or now - generated > timedelta(hours=max_age_hours):
         raise ValueError("网站事件快照过期或时间无效，停止发送；请检查来源更新任务。")
@@ -134,6 +138,8 @@ def validate_snapshot(snapshot, now, *, max_age_hours=2):
             if not parse_publication_time(doc.get("published_at")) or not doc.get("publication_source"):
                 raise ValueError("Missing verified original publication")
         for progress in event["progresses"]:
+            if 'importance_score' in progress and (not math.isfinite(float(progress['importance_score'])) or float(progress['importance_score']) < 0):
+                raise ValueError('Invalid progress importance')
             key = progress.get("id")
             if not key or key in progresses or progress.get("event_id") != event["id"]:
                 raise ValueError("Duplicate/orphan progress ID")
@@ -146,8 +152,8 @@ def validate_snapshot(snapshot, now, *, max_age_hours=2):
 
 def select_snapshot(snapshot, history, now, batch, *, limit=20):
     validate_snapshot(snapshot, now)
-    hours = 12 if batch == "0700" else 6
-    cutoff = now - timedelta(hours=hours)
+    window = delivery_window(now, batch)
+    cutoff = parse_publication_time(window["window_start"])
     aliases = snapshot.get("id_aliases", {}).get("progresses", {})
     sent = sent_progress_ids(history, aliases)
     held = uncertain_progress_ids(history, aliases)
@@ -185,9 +191,10 @@ def select_snapshot(snapshot, history, now, batch, *, limit=20):
             title = progress["title"]
             if title.startswith("客服回应："):
                 title = re.split(r"[，,；;]", event["title"])[0] + "；" + title
+            ranking = rank_snapshot_progress(event, progress, now)
             candidates.append({"track": category, "progress_id": key, "event_id": event["id"],
                 "title": title, "url": representative["url"], "doc_ids": [doc["doc_id"] for doc in members],
-                "first_reported_at": at.isoformat(), "score": event["score"], "progress_type": progress["type"]})
+                **ranking, "progress_type": progress["type"]})
     seen = set()
     for item in sorted(candidates, key=lambda item: (-item["score"], -parse_publication_time(item["first_reported_at"]).timestamp(), item["progress_id"])):
         if item["progress_id"] in seen:
@@ -252,7 +259,7 @@ def generate(snapshot_path, history_path, output_dir, now, batch, *, limit=20, r
     items = [item for key in FEISHU_CATEGORY_ORDER for item in selected[key]]
     report = {"pipeline": PIPELINE, "mode": "dry-run", "batch_id": f"{now:%Y%m%d}-{batch}",
         "batch": batch, "batch_time": batch[:2] + ':' + batch[2:], "generated_at": now.isoformat(),
-        "lookback_hours": 12 if batch == "0700" else 6, "limit_per_track": limit,
+        **delivery_window(now, batch), "limit_per_track": limit, "ranking_policy": RANKING_POLICY,
         "delivery_tracks": list(FEISHU_CATEGORY_ORDER),
         "snapshot_generated_at": snapshot["generated_at"], "id_aliases": snapshot.get("id_aliases", {}),
         "source_status": snapshot.get("source_status", []), "selected_items": items,
