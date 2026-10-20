@@ -2,6 +2,11 @@ name: Inspect NEWSHOT refresh backend permissions
 
 on:
   workflow_dispatch:
+    inputs:
+      apply:
+        description: Configure the existing Pages project with the refresh relay
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -13,7 +18,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Inspect existing project and storage capabilities (read-only)
-        run: python3 tools/refresh_cloud_setup.py
+        run: python3 tools/refresh_cloud_setup.py ${{ inputs.apply && '--apply' || '' }}
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          NEWSHOT_REFRESH_ADMIN_HASH: ${{ secrets.NEWSHOT_REFRESH_ADMIN_HASH }}
+          NEWSHOT_REFRESH_AGENT_HASH: ${{ secrets.NEWSHOT_REFRESH_AGENT_HASH }}
+          NEWSHOT_REFRESH_SESSION_SECRET: ${{ secrets.NEWSHOT_REFRESH_SESSION_SECRET }}
