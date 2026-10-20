@@ -25,8 +25,9 @@ from news_event_clustering import (
 )
 from news_freshness import china_time
 from news_fact_normalization import financial_scope, quantity_tokens, scopes_conflict
+from news_fact_identity import fact_identity, same_fact, event_key, market_parts, market_fact, policy_objects, policy_conflict, dated_policy
 
-VERSION = 2
+VERSION = 5
 MAX_CANDIDATES = 40
 MAX_REPRESENTATIVES = 4
 TYPE_LABELS = {
@@ -66,6 +67,8 @@ def block_keys(value):
     # Do not index ubiquitous bigrams/country names as candidate subjects.
     weak = {"中国", "美国", "日本", "俄罗斯", "人民币", "黄金", "白银", "原油", "ai"}
     keys = {"entity:" + entity for entity in value.entities - weak}
+    if value.fact:
+        keys.add('entity:fact:' + event_key(value.fact))
     if value.subject:
         keys.add("entity:" + value.subject)
     # Long concrete fragments recall unlisted universities/venues/products too.
@@ -80,6 +83,24 @@ class Statement:
     title: str
     claim: str
     numbers: tuple[str, ...] = ()
+
+
+def statement_identity(value):
+    return json.loads(value.claim[5:]) if value.claim.startswith('fact:') else fact_identity(value.title)
+
+
+def enriched_claim(old,new):
+    a,b=statement_identity(old),statement_identity(new)
+    if a and b and a['family']==b['family']=='policy' and same_fact(a,b):
+        enriched={**a}
+        for key in ('reference','effective_date'):
+            enriched[key]=a.get(key) or b.get(key,'')
+        if b.get('date_explicit'):
+            enriched.update(date=b['date'],date_explicit=True)
+        return 'fact:'+json.dumps(enriched,ensure_ascii=False,sort_keys=True)
+    if a and b and a['family']==b['family'] and a['family'] in {'speech','press-release'} and same_fact(a,b):
+        return 'fact:'+json.dumps({**a,'views':list(dict.fromkeys(a['views']+b['views']))[:8]},ensure_ascii=False,sort_keys=True)
+    return old.claim
 
 
 def amount_tokens(text):
@@ -97,9 +118,22 @@ def statements(item):
     text = re.sub(r"#([^#]+)#", r"\1", head)
     body = str(item.summary or "")[:700]
     combined = text + "\n" + body
+    def dated(identity):
+        at=getattr(item,'published_dt',None) or getattr(item,'first_dt',None)
+        if at:
+            identity=dated_policy(identity,china_time(at).strftime('%Y-%m-%d'))
+        if identity and identity['family'] in {'market','speech','usage-response','press-release'} and at:
+            return {**identity,'publication_day':china_time(at).strftime('%Y-%m-%d')}
+        return identity
+    parts = market_parts(text)
+    if all(market_fact(part) for part in parts):
+        return [Statement('report',part,'fact:'+json.dumps(dated(market_fact(part)),ensure_ascii=False,sort_keys=True),amount_tokens(part)) for part in parts[:4]]
+    identity = dated(fact_identity(text,body))
+    if identity and identity['family']=='policy':
+        return [Statement('report',text,'fact:'+json.dumps(identity,ensure_ascii=False,sort_keys=True),amount_tokens(text))]
     results = []
     quality = bool(re.search(r"铅(?:含量)?超标|检出|质量问题|不合格", text))
-    response = bool(re.search(r"回应|辟谣|否认|客服.{0,6}(?:称|表示|答复)|官方客服", text))
+    response = bool(re.search(r"回应|辟谣|否认|客服.{0,6}(?:称|表示|答复)|官方客服", text)) or bool(identity and identity['family'] in {'press-release','usage-response'})
     if quality:
         disclosure = re.split(r"[，,。；;]|\s+(?=(?:官方|客服|平台|公司))", text)[0]
         # "客服回应产品超标" asserts a response, not another detection.
@@ -128,6 +162,8 @@ def statements(item):
             # A title repeating only the incident contains no new response detail.
             if re.search(r"检出|超标|相关问题", claim) and not re.search(r"否认|未|已|将|停止|承认|核查", claim):
                 claim = "unspecified"
+        if identity and identity['family'] in {'speech','usage-response','press-release'}:
+            claim='fact:'+json.dumps(identity,ensure_ascii=False,sort_keys=True)
         results.append(Statement("response", title, claim))
     for kind, pattern in (
         ("withdrawal", r"下架"), ("recall", r"召回"),
@@ -139,7 +175,9 @@ def statements(item):
             results.append(Statement(kind, claim or text, normalize(claim or text)))
     if not results:
         kind = "report"
-        if "回购" in text:
+        if identity and identity['family']=='capacity-approval':
+            kind='approval'
+        elif "回购" in text:
             kind = "buyback-completed" if re.search(r"已回购|完成回购|累计回购", text) else (
                 "buyback-approved" if re.search(r"审议通过|获批|批准", text) else "buyback-proposal")
         elif re.search(r"开幕|启幕|首秀", text):
@@ -153,6 +191,8 @@ def statements(item):
         numbers = amount_tokens(text)
         scope = financial_scope(text, body)
         claim = 'financial:' + json.dumps(scope, sort_keys=True, ensure_ascii=False) if scope else normalize(text)
+        if identity:
+            claim='fact:'+json.dumps(identity,ensure_ascii=False,sort_keys=True)
         results.append(Statement(kind, text, claim, numbers))
     return results[:4]
 
@@ -160,6 +200,11 @@ def statements(item):
 def same_progress(left: Statement, right: Statement):
     if left.kind != right.kind:
         return False
+    if policy_conflict(left.title,right.title):
+        return False
+    typed = same_fact(statement_identity(left),statement_identity(right))
+    if typed is not None:
+        return typed
     # Re-extract old persisted titles too: v1 tokens lost leading minus signs.
     # Reinterpreting the same original fact must not create a new identity.
     left_numbers = amount_tokens(left.title) or amount_tokens(' '.join(left.numbers))
@@ -204,6 +249,7 @@ class Progress:
     first_reported_at: datetime
     items: list
     doc_ids: list[str]
+    identity: dict | None = None
 
 
 @dataclass
@@ -333,6 +379,9 @@ class EventRegistry:
             current = Statement(row["kind"], row["title"], row["claim"], tuple(json.loads(row["numbers"])))
             match = next((other for other in representatives if same_progress(current, Statement(other["kind"], other["title"], other["claim"], tuple(json.loads(other["numbers"]))))), None)
             if match:
+                merged=enriched_claim(Statement(match['kind'],match['title'],match['claim']),current)
+                self.db.execute('UPDATE progresses SET claim=? WHERE id=?',(merged,match['id']))
+                match['claim']=merged
                 self.db.execute("UPDATE progresses SET merged_into=? WHERE id=?", (match["id"], row["id"]))
                 self.db.execute("INSERT OR IGNORE INTO progress_docs SELECT ?,doc_id FROM progress_docs WHERE progress_id=?", (match["id"], row["id"]))
                 self.db.execute("UPDATE progresses SET first_reported=MIN(first_reported,?) WHERE id=?", (row['first_reported'], match['id']))
@@ -342,6 +391,67 @@ class EventRegistry:
                     match.update(title=row["title"], claim=row["claim"])
             else:
                 representatives.append(dict(row))
+
+    def refresh_derived_statements(self,item):
+        """Reinterpret unchanged facts in place, never reset IDs or source times.
+
+        An updated article may support old and new nodes. Only the matching
+        original headline is reinterpreted; unrelated historical nodes are not.
+        """
+        head=clean_headline(item)
+        fresh=statements(item)
+        rows=self.db.execute('''SELECT p.* FROM progresses p JOIN progress_docs pd ON pd.progress_id=p.id
+            WHERE pd.doc_id=? AND p.merged_into IS NULL''',(document_id(item),)).fetchall()
+        for row in rows:
+            # Old broad-policy grouping sometimes attached a different object
+            # (e.g. dredgers) to a drone node. Remove only this proven-wrong link;
+            # assignment below retains the document and gives its own node.
+            if any(statement_identity(s) and statement_identity(s)['family']=='policy' for s in fresh) and policy_conflict(row['title'],head):
+                self.db.execute('DELETE FROM progress_docs WHERE progress_id=? AND doc_id=?',(row['id'],document_id(item)))
+                self.stats['policy_document_links_repaired']+=1
+                continue
+            if normalize(row['title'])!=normalize(head) and row['title'] not in {'研选•行业数据','研选·行业数据'}:
+                continue
+            generic=row['title'] in {'研选•行业数据','研选·行业数据'}
+            promote = generic or any(statement_identity(s) and statement_identity(s)['family'] in {'press-release','usage-response','capacity-approval','policy'} for s in fresh)
+            candidates=fresh if promote else [s for s in fresh if s.kind==row['kind']]
+            if candidates:
+                new=candidates[0]
+                old=Statement(row['kind'],row['title'],row['claim'])
+                old_fact,new_fact=statement_identity(old),statement_identity(new)
+                if row['claim'].startswith('fact:') and old_fact and not new_fact:
+                    continue  # A truncated excerpt is not evidence retracting a proven identity.
+                if row['claim'].startswith('fact:') and old_fact and new_fact and old_fact['family']==new_fact['family']=='policy' and not same_fact(old_fact,new_fact):
+                    continue  # A genuine revision of an existing article is new progress.
+                self.db.execute('UPDATE progresses SET kind=?,title=?,claim=?,numbers=? WHERE id=?',
+                    (new.kind,new.title,new.claim,json.dumps(new.numbers),row['id']))
+
+    def repair_policy_boundaries(self,event_id):
+        """Undo a legacy broad-policy merge without recycling any progress ID."""
+        rows=self.db.execute('SELECT * FROM progresses WHERE event_id=? AND merged_into IS NULL ORDER BY first_reported,rowid',(event_id,)).fetchall()
+        groups=[]
+        for row in rows:
+            objects=policy_objects(row['title'])
+            objects={'无人机' if o=='无人驾驶航空器' else o for o in objects}
+            if not objects:
+                continue
+            group=next((g for g in groups if g[0]&objects),None)
+            if group:
+                group[0].update(objects);group[1].append(row)
+            else:
+                groups.append([set(objects),[row]])
+        if len(groups)<2:
+            return
+        for _,members in groups[1:]:
+            new=new_id('event')
+            self.db.execute('INSERT INTO events(id,created) VALUES(?,?)',(new,time.time()))
+            for row in members:
+                self.db.execute('UPDATE progresses SET event_id=? WHERE id=?',(new,row['id']))
+                self.db.execute('INSERT OR IGNORE INTO event_docs SELECT ?,doc_id FROM progress_docs WHERE progress_id=?',(new,row['id']))
+            self.stats['policy_event_splits']+=1
+        # Keep a shared document on both events if it explicitly supports both.
+        self.db.execute('''DELETE FROM event_docs WHERE event_id=? AND doc_id NOT IN
+            (SELECT pd.doc_id FROM progress_docs pd JOIN progresses p ON p.id=pd.progress_id WHERE p.event_id=?)''',(event_id,event_id))
 
     def supporting_statement(self, item, value, statement, event_id):
         # A publisher may use a poetic website title and quote that exact title
@@ -407,6 +517,8 @@ class EventRegistry:
                     self.stats["unchanged_docs"] += 1
                     continue
                 value = self.cache[key]
+                if existing and owners:
+                    self.refresh_derived_statements(item)
                 published = china_time(item.published_dt or item.first_dt).timestamp()
                 matches = {}
                 representatives = {}
@@ -427,6 +539,7 @@ class EventRegistry:
                 existing_owner = self.resolve("events", owners[0][0]) if owners else None
                 if existing_owner:
                     event_id = existing_owner
+                    representatives.setdefault(event_id,value)
                 elif matches:
                     # Insertion follows the deterministic indexed document order;
                     # a randomly allocated UUID must never break a score tie.
@@ -468,6 +581,8 @@ class EventRegistry:
                             break
                     if match:
                         progress_id = match["id"]
+                        self.db.execute('UPDATE progresses SET claim=? WHERE id=?',
+                            (enriched_claim(Statement(match['kind'],match['title'],match['claim']),statement),progress_id))
                         self.db.execute("UPDATE progresses SET first_reported=MIN(first_reported,?) WHERE id=?", (published, progress_id))
                         if match["claim"] == "unspecified" and statement.claim != "unspecified":
                             self.db.execute("UPDATE progresses SET title=?,claim=? WHERE id=?", (statement.title, statement.claim, progress_id))
@@ -485,6 +600,7 @@ class EventRegistry:
             # alias, so previous Feishu ACKs continue to suppress repeats.
             for event_id in {self.resolve('events', key) for key in affected_events}:
                 self.reconcile_progresses(event_id)
+                self.repair_policy_boundaries(event_id)
             self.db.commit()
         except BaseException:
             self.db.rollback()
@@ -505,7 +621,8 @@ class EventRegistry:
                     if doc_ids:
                         progresses[event_id].append(Progress(row["id"], event_id, row["title"], row["kind"],
                             datetime.fromtimestamp(row["first_reported"], china_time(ordered[0].published_dt or ordered[0].first_dt).tzinfo),
-                            [current[key] for key in doc_ids], doc_ids))
+                            [current[key] for key in doc_ids], doc_ids,
+                            statement_identity(Statement(row['kind'],row['title'],row['claim']))))
         self.stats["events"] = len(groups)
         self.stats["progresses"] = sum(map(len, progresses.values()))
         self.stats["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)

@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from news_freshness import CHINA, WINDOW_HOURS, china_time, parse_publication_time, select_home_items, write_json
@@ -1044,6 +1045,16 @@ def home_representative(items):
     return max(items, key=priority)
 
 
+def home_progress_representative(progress):
+    if progress.identity and progress.identity.get('family')=='policy' and progress.identity.get('stage')=='publication':
+        # Point the announcement at its text rather than an explanatory Q&A
+        # merely because that article has a longer headline/higher source score.
+        candidates=[item for item in progress.items if not re.search(r'答记者问|新闻发言人|解读|沟通对话',clean_headline(item))]
+        if candidates:
+            return max(candidates,key=lambda item:((urlsplit(item.url).hostname or '').endswith('.gov.cn'),display_score(item),-len(clean_headline(item))))
+    return home_representative(progress.items)
+
+
 def cluster_home_events(items: list[RawItem], *, registry_path: Path | None = None, stats: dict | None = None,
                         aliases: dict | None = None) -> list[Event]:
     events = []
@@ -1078,7 +1089,7 @@ def current_event_view(event: Event, cutoff: datetime, *, now: datetime | None =
             members = [item for item in progress.items if (item.doc_id or document_id(item)) in allowed]
             if members:
                 progresses.append(HomeProgress(progress.key, event.key, progress.title, progress.kind,
-                    progress.first_reported_at, members, [item.doc_id or document_id(item) for item in members]))
+                    progress.first_reported_at, members, [item.doc_id or document_id(item) for item in members], progress.identity))
         active = {key for progress in progresses for key in progress.doc_ids}
         recent = [item for item in recent if (item.doc_id or document_id(item)) in active]
     if not recent:
@@ -2563,6 +2574,7 @@ def home_event_snapshot(events: list[Event], source_records: int, stats: dict, a
     return {
         "schema_version": 3, "model": "event-progress-doc", "pipeline": "shared-home-v1",
         "generated_at": now.isoformat(), "source_records": source_records, "ranking_policy": RANKING_POLICY,
+        "fact_policy": "role-facts-v1",
         "categories": [{"id": key, "name": home_category_label(key)} for key in HOME_CATEGORY_ORDER],
         "clustering": stats, "id_aliases": aliases,
         "source_status": freshness_report.get("native_sources", []),
@@ -2577,8 +2589,9 @@ def home_event_snapshot(events: list[Event], source_records: int, stats: dict, a
                 "type": progress.kind, "first_reported_at": china_time(progress.first_reported_at).isoformat(),
                 **{name:rankings[event.key][progress.key][name] for name in ('importance_score','score','decay_factor')},
                 "doc_ids": progress.doc_ids,
-                "representative_doc_id": home_representative(progress.items).doc_id,
-                "representative_url": home_representative(progress.items).url,
+                "fact_identity": progress.identity,
+                "representative_doc_id": home_progress_representative(progress).doc_id,
+                "representative_url": home_progress_representative(progress).url,
             } for progress in event.progresses],
             "reports": [{
                 "doc_id": item.doc_id, "source_id": item.source_id, "source_name": item.source_name,

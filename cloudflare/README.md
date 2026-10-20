@@ -8,6 +8,8 @@
 https://newshot-5jq.pages.dev/
 ```
 
+2026-10-20 去重与分类规则发布、只读离线构建及无飞书发送的验收说明见 [去重规则上线](../docs/dedup-release-20261020.md)。
+
 当前使用 Cloudflare Pages 承载经过白名单打包的 `.site-deploy-dist/` 静态目录，同时通过 `_worker.js` 提供少量公开实时接口。禁止直接上传 `output/`，其中可能包含本地数据库、调试日志和飞书发送历史。
 
 ## 1. Pages 项目

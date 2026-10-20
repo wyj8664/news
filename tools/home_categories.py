@@ -8,6 +8,8 @@ from __future__ import annotations
 import html
 import re
 from typing import Iterable
+from news_editorial_quality import rejection_reason
+from news_fact_normalization import financial_scope
 
 
 CATEGORY_LABELS = {
@@ -196,9 +198,9 @@ def public_category(title: str, summary: str = "") -> str:
 # corporate-finance words. Do not treat all IPOs/earnings as financial-sector news.
 RULES = {
     "hardtech": (
-        (r"人工智能|大模型|智能体|具身智能|机器人|外骨骼|芯片|半导体|晶圆|光刻|封测|算力|超算|超导|曙光8000|量子|光通信|光模块|数据中心|云计算|科技要闻|干细胞|细胞治疗", 20),
+        (r"人工智能|大模型|智能体|具身智能|机器人|外骨骼|芯片|半导体|晶圆|光刻|封测|算力|超算|超导|曙光8000|量子|光通信|光模块|数据中心|云计算|数控机床|工业母机|高端装备|科技要闻|干细胞|细胞治疗", 20),
         (r"(?<![a-z0-9])(?:ai|gpu|cpu|gpt\d*|chatgpt|cpo|6g|5g)(?![a-z0-9])", 18),
-        (r"手机|消费电子|智能终端|智能手表|折叠屏|操作系统|计算机|服务器|航空制造|商业航天|航天|火箭|卫星|飞船|探测器|无人机|低空经济|合成生物|生物制造", 18),
+        (r"手机|消费电子|智能终端|智能手表|折叠屏|操作系统|计算机|服务器|航空制造|商业航天|航天|火箭|卫星|飞船|探测器|无人机|无人驾驶航空器|低空经济|合成生物|生物制造", 18),
         (r"英伟达|英特尔|台积电|中芯国际|海力士|美光|高通|宇树|寒武纪|科大讯飞|华为|小米|苹果公司|苹果(?=发布|推出|财报|营收)|(?<![a-z])(?:openai|anthropic|deepseek|nvidia|asml|amd)(?![a-z])", 8),
     ),
     "commodities": (
@@ -208,10 +210,10 @@ RULES = {
     ),
     "consumer": (
         (r"新消费|消费品|零售|电商|直播带货|即时零售|跨境电商|餐饮|茶饮|咖啡|奶茶|白酒|啤酒|饮料|乳制品|预制菜|保健品|褪黑素|美妆|化妆品|护肤|服装|服饰|鞋服|潮玩|免税|酒店|旅游|文旅|家电|宠物经济", 20),
-        (r"茅台|五粮液|瑞幸|星巴克|蜜雪|霸王茶姬|喜茶|奈雪|农夫山泉|伊利|蒙牛|海底捞|麦当劳|肯德基|泡泡玛特|安踏|李宁|珀莱雅|携程|美团|拼多多|淘宝|天猫|京东(?!物流)|阿里巴巴|健合|(?<![a-z])swisse(?![a-z])", 8),
+        (r"茅台|五粮液|瑞幸|星巴克|蜜雪|霸王茶姬|喜茶|奈雪|农夫山泉|伊利|蒙牛|海底捞|麦当劳|肯德基|泡泡玛特|山姆|沃尔玛|安踏|李宁|珀莱雅|携程|美团|拼多多|淘宝|天猫|京东(?!物流)|阿里巴巴|健合|(?<![a-z])swisse(?![a-z])", 8),
     ),
     "auto": (
-        (r"汽车|车企|整车|乘用车|商用车|电动车|新能源车|智能驾驶|自动驾驶|辅助驾驶|无人驾驶|智驾|车载|车规|新车|车市|购车|车型|车展|车联网|网约车|埃安|岚图|阿维塔|极氪|极狐|(?<![a-z])suv(?![a-z])", 20),
+        (r"汽车|车企|整车|乘用车|商用车|电动车|新能源车|智能驾驶|自动驾驶|辅助驾驶|无人驾驶(?!航空器)|智驾|车载|车规|新车|车市|购车|车型|车展|车联网|网约车|埃安|岚图|阿维塔|极氪|极狐|小马智行|文远知行|萝卜快跑|(?<![a-z])suv(?![a-z])", 20),
         (r"比亚迪|特斯拉|蔚来|小鹏|理想汽车|零跑|小米汽车|吉利|长城汽车|长安汽车|上汽|一汽|广汽|东风汽车|赛力斯|鸿蒙智行|问界|智界|宝马|奔驰|奥迪|大众汽车|丰田|本田|保时捷|法拉利|(?<![a-z])tesla(?![a-z])", 8),
         (r"交付量|汽车销量|乘联会|中汽协|燃油车|智能座舱", 12),
     ),
@@ -314,6 +316,8 @@ def military_politics_only(title: str) -> bool:
 
 def classify_text(title: str, summary: str = "") -> str:
     title = _clean(title)
+    if rejection_reason(title,summary):
+        return ALL_ONLY_CATEGORY
     # Securities misconduct is a financial-market story even if the subject is
     # a non-financial company or the headline emphasizes the criminal sentence.
     if SECURITIES_MISCONDUCT.search(title[:400]) or (
@@ -323,6 +327,27 @@ def classify_text(title: str, summary: str = "") -> str:
         return "finance"
     # Native feed headlines in brackets often precede the full article body.
     focus = headline_focus(title)
+    if re.search(r'运价|航运指数|集装箱结算',focus) and not re.search(r'ETF|基金|股价|股票',focus,re.I):
+        return 'logistics'
+    if re.search(r'(?:AI|人工智能).{0,5}剧.{0,12}(?:激励|奖励|补贴|扶持)计划',focus,re.I):
+        return 'consumer'
+    broker=bool(re.search(r'投行|券商|证券|小摩|大摩|高盛|摩根|花旗|瑞银|巴克莱|美银|汇丰|杰富瑞|考恩',focus))
+    research=bool(re.search(r'目标价|(?:增持|减持|买入|卖出|中性|跑赢|跑输|持有).{0,6}评级',focus))
+    physical_price=bool(re.search(r'(?:黄金|白银|原油|天然气|煤炭|铜|铝)(?:价格|目标价)',focus))
+    if broker and research and not physical_price:
+        return 'finance'
+    if re.search(r'上.{0,12}当|AI.{0,30}(?:骗局|诈骗|欺诈|卖惨)|(?:AI|深度伪造).{0,12}(?:骗|冒充)',focus,re.I):
+        return public_category(title,summary)
+    # AI can be the means of a rumour, not the industry the story is about.
+    if re.search(r'(?:AI|人工智能).{0,8}(?:造假|假视频|伪造|谣言)|误信AI|AI影片',focus,re.I):
+        consumer = any(re.search(pattern,focus,re.I) for pattern,_ in RULES['consumer'])
+        if consumer or re.search(r'顾客|商超|超市|门店|零售|消费者',focus):
+            return 'consumer'
+        return public_category(title,summary)
+    if re.search(r'窃听|骨灰.{0,8}被盗|嫌疑人.{0,12}(?:被捕|逃)|接受审查调查',focus) and not re.search(r'数据泄露|网络攻击|商业机密|供应|生产|经营|营收',focus):
+        return public_category(title,summary)
+    if re.search(r'(?:建议|呼吁).{0,10}(?:减仓|加仓)|(?:美股|股市|股票).{0,25}(?:抛售|反弹)|(?:抛售|反弹).{0,25}(?:美股|股市|股票)',focus,re.I):
+        return 'finance'
     if financial_instrument_news(focus):
         return "finance"
     if military_politics_only(focus):
@@ -337,9 +362,18 @@ def classify_text(title: str, summary: str = "") -> str:
         return public_category(title, summary)
     scores = category_scores(focus)
     industry = [category for category in CATEGORY_ORDER if category not in {"finance", "society"}]
+    # An otherwise vague earnings title may use an explicit operating-business
+    # description in the source opening, not a later shareholder background.
+    if financial_scope(focus) and scores['finance']<=4 and max(scores[k] for k in industry)==0:
+        opening=_clean(summary)[:400]
+        if re.search(r'主营|从事|业务|产品|行业',opening):
+            context=category_scores(opening)
+            sector=max(industry,key=lambda k:context[k])
+            if context[sector]>=18:
+                return sector
     # A sector ETF/stock-price move is a market story, but a company's financial
     # report stays in its industry. Physical commodity quotes stay in 大宗.
-    quote = re.search(r"(?<![a-z])ETF(?![a-z])|股价|市值|涨停|跌停|领涨|领跌|板块|股指|指数|(?:[中美港A]股|股票).*(?:涨|跌|开盘|收盘)", focus, re.I)
+    quote = re.search(r"(?<![a-z])ETF(?![a-z])|股价|市值|涨停|跌停|领涨|领跌|板块|股指|指数|概念.{0,10}(?:走强|走高|拉升|上涨|下跌)|科技(?:盘中)?(?:大|暴|直线)?(?:涨|跌)|(?:[中美港A]股|股票).*(?:涨|跌|开盘|收盘)", focus, re.I)
     product = re.search(r"发布|推出|投产|量产|研发|突破|新车|交付|销量|财报|营收|利润", focus)
     if quote and not product and (not scores["commodities"] or re.search(r"(?<![a-z])ETF(?![a-z])|基金|股票|板块|股价", focus, re.I)):
         return "finance"

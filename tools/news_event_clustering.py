@@ -10,6 +10,7 @@ import urllib.parse
 
 from news_freshness import china_time
 from news_fact_normalization import canonical_quantities, reporting_period
+from news_fact_identity import fact_identity, same_fact, policy_conflict, dated_policy, same_policy
 
 PUBLISHERS = {
     "cls-hot": "cls", "cls-telegraph": "cls", "jin10-flash": "jin10", "jin10-all": "jin10",
@@ -101,6 +102,8 @@ def headline_views(item) -> list[str]:
     """Derived matching views only; never overwrite a publisher's original text."""
     raw = re.sub(r"<[^>]+>", "", str(item.title))
     summary = re.sub(r"<[^>]+>", "", str(item.summary or ""))[:800]
+    # Column labels aren't a factual headline; keep the actual text after them.
+    raw = re.sub(r'^【(?:研选[•·・｜|]?行业数据|盘中宝|电报解读|公告全知道|机构调研)】\s*', '', raw)
     def strip(value):
         value = re.sub(r"#([^#]+)#", r"\1", value)
         return re.sub(r"^(?:鲸视频|视频|快讯|独家|一探)[：:]", "", value).strip()
@@ -186,6 +189,8 @@ class Features:
     subject: str = ""
     dates: set[str] = None
     issues: set[str] = None
+    fact: dict | None = None
+    published_day: str = ''
 
 
 def features(item) -> Features:
@@ -258,8 +263,12 @@ def features(item) -> Features:
         products.update(re.findall(r"抗糖丸|褪黑素|蛋白粉|奶粉", issue_context))
         if products and issues:
             actions.add("quality")
+    published = getattr(item,'published_dt',None) or getattr(item,'first_dt',None)
     return Features(text, actors, actions, object_grams, grams(text) | grams(text, 3), quarters, models,
-                    article_url(item.url), digest, quake_time, views, products, subject, dates, issues)
+                    article_url(item.url), digest, quake_time, views, products, subject, dates, issues,
+                    dated_policy(fact_identity(clean_headline(item), str(item.summary or '')[:700]),
+                                 china_time(published).strftime('%Y-%m-%d') if published else ''),
+                    china_time(published).strftime('%Y-%m-%d') if published else '')
 
 
 def same_event(left: Features, right: Features, idf: dict[str, float]) -> bool:
@@ -309,6 +318,20 @@ def same_event(left: Features, right: Features, idf: dict[str, float]) -> bool:
 
 def event_match(left: Features, right: Features) -> tuple[float, str]:
     """Conservative multi-view matching for the durable registry, not a topic key."""
+    if policy_conflict(left.text,right.text):
+        return 0, 'conflicting-policy-object'
+    if left.fact and right.fact:
+        a,b=left.fact,right.fact
+        if a['family']==b['family']=='policy':
+            return (.98,'same-regulatory-document') if same_policy(a,b) else (0,'conflicting-regulatory-document')
+        if a['family']==b['family'] and a['family'] in {'market','speech','usage-response','press-release'} and left.published_day and right.published_day and left.published_day!=right.published_day:
+            return 0, 'different-publication-day'
+        if same_fact(a,b) is True:
+            return .98, 'same-typed-fact'
+        if a['family']==b['family']=='market' and all(a.get(k)==b.get(k) for k in ('actor','contract','phase')):
+            return .94, 'same-market-series'
+        if a['family']==b['family'] and a['actor']!=b['actor']:
+            return 0, 'conflicting-fact-actor'
     if 'earnings' in left.actions & right.actions:
         a_year, a_period = reporting_period(left.text)
         b_year, b_period = reporting_period(right.text)

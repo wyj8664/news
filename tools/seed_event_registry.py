@@ -58,6 +58,11 @@ def seed(output, path):
                     matches=statements(SimpleNamespace(title=progress['title'],summary='',url=''))
                     statement=next((value for value in matches if value.kind==progress['type']),
                                    Statement(progress['type'],progress['title'],normalize(progress['title'])))
+                    if isinstance(progress.get('fact_identity'),dict) and progress['fact_identity'].get('family'):
+                        # This evidence is already public and hash-checked. A cold
+                        # cloud checkout must not downgrade it to a title-only guess.
+                        statement=Statement(progress['type'],progress['title'],
+                            'fact:'+json.dumps(progress['fact_identity'],ensure_ascii=False,sort_keys=True),statement.numbers)
                     registry.db.execute('INSERT OR IGNORE INTO progresses VALUES(?,?,?,?,?,?,?,NULL)',
                         (key,event_id,progress['type'],progress['title'],statement.claim,json.dumps(statement.numbers),first.timestamp()))
                     registry.db.executemany('INSERT OR IGNORE INTO progress_docs VALUES(?,?)',
