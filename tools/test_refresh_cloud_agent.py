@@ -57,5 +57,22 @@ class RelayTests(unittest.TestCase):
         calls=self.relay.request.call_args_list
         self.assertEqual(calls[1].args[0],'status');self.assertIsNone(calls[1].args[1]['job'])
 
+    def test_stage_uses_approved_public_staging_path_and_commits_after_upload(self):
+        generation='2026-10-20T09:00:00+08:00'
+        job={'id':'job','phase':'weibo','published_generation':generation}
+        self.relay.local=Mock(return_value={'job':job})
+        self.relay.upload=Mock();self.relay.request=Mock(return_value={'ok':True})
+        def pack(output,dest):
+            self.assertTrue(dest.name.startswith('.site-deploy'))
+            dest.mkdir()
+            (dest/'index.html').write_text(f'<main data-home-generation="{generation}"></main>')
+            (dest/'site-manifest.json').write_text(json.dumps({'files':{'index.html':'ignored'}}))
+        with patch('refresh_cloud_agent.pack',side_effect=pack):
+            self.assertTrue(self.relay.publish(job))
+        self.relay.upload.assert_called_once()
+        self.assertEqual(self.relay.request.call_args.args[0],'publish')
+        self.assertEqual(self.relay.get('published'),generation)
+        self.assertFalse(self.relay.publish(job))
+
 
 if __name__=='__main__':unittest.main()

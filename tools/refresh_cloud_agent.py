@@ -125,7 +125,7 @@ class Relay:
             return False
         # Existing runner sets publishing BEFORE writing; compare again after copy.
         with tempfile.TemporaryDirectory(prefix='public-stage-',dir=self.directory) as directory:
-            dest=Path(directory)/'public'
+            dest=Path(directory)/'.site-deploy-public'
             pack(self.root/'output',dest)
             latest=self.local('/status')['job']
             if not latest or latest['id']!=job['id'] or latest.get('phase')=='publishing' or latest.get('published_generation')!=generation:
