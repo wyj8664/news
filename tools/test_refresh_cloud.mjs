@@ -63,4 +63,5 @@ test('publish rejects private paths and missing files; only complete versions be
   assert.equal((await publish({'index.html':digest})).status,200);
   const page=await worker.fetch(new Request(origin+'/'),env);
   assert.equal(page.headers.get('Content-Encoding'),'gzip');assert.equal(page.headers.get('X-Newshot-Generation'),generation);
+  assert(source.includes("{encodeBody:'manual',headers:{'Content-Type':type,'Content-Encoding':'gzip'"));
 });

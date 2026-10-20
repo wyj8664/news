@@ -317,7 +317,7 @@ async function refreshAsset(request,url,env) {
     const bytes=await env.NEWSHOT_REFRESH.get('asset:'+hash,{type:'arrayBuffer'});
     if(!bytes) return refreshReply({ok:false,error:'新版本正在同步，请稍后刷新。'},503,{'Retry-After':'30'});
     const type=name.endsWith('.html')?'text/html; charset=utf-8':name.endsWith('.json')?'application/json; charset=utf-8':name.endsWith('.js')?'text/javascript; charset=utf-8':'text/plain; charset=utf-8';
-    return new Response(request.method==='HEAD'?null:bytes,{headers:{'Content-Type':type,'Content-Encoding':'gzip',
+    return new Response(request.method==='HEAD'?null:bytes,{encodeBody:'manual',headers:{'Content-Type':type,'Content-Encoding':'gzip',
       'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','X-Newshot-Generation':current.generation}});
   } catch { return refreshReply({ok:false,error:'最新页面暂不可用，请稍后重试。'},503); }
 }
