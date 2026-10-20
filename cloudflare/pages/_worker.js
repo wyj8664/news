@@ -267,9 +267,9 @@ async function remoteRefresh(request,url,env) {
     return refreshReply({ok:false},405);
   }
   if(path==='status' && request.method==='GET') {
-    const session=await refreshSession(request,env);
-    const command=(await refreshCommands(kv))[0]||null;
-    const report=await kv.get('agent:status','json');
+    const [session,commands,report]=await Promise.all([
+      refreshSession(request,env),refreshCommands(kv),kv.get('agent:status','json')]);
+    const command=commands[0]||null;
     const job=command && report?.request_id===command.id && report.job ? report.job : command?refreshWaiting(command):null;
     const online=!!report && Date.now()-Date.parse(report.seen_at)<600000;
     return refreshReply({ok:true,available:true,mode:'remote',authenticated:!!session,nonce:session?.nonce||'',

@@ -8,6 +8,7 @@
   const sources = document.getElementById('home-refresh-sources');
   const labels = {pending:'等待', running:'采集中', updated:'已更新', cached:'用缓存', partial:'部分更新', failed:'失败', paused:'已暂停', disabled:'未启用'};
   let nonce = '', timer, inFlight = false, active = false, retryAt = 0, remote = false, authenticated = false;
+  let reconnecting = false, failures = 0, lastConnectedAt = 0;
   const format = value => {
     const date = new Date(value);
     return value && Number.isFinite(date.getTime()) ? date.toLocaleString('zh-CN', {timeZone:'Asia/Shanghai', hour12:false}) : '未知';
@@ -18,6 +19,7 @@
     button.disabled = active || Date.now() < retryAt;
     button.textContent = active ? '更新中…' : Date.now() < retryAt ? '冷却中' : '更新领域分类';
     if (!job) {
+      progress.hidden = true; details.hidden = true;
       status.textContent = remote ? '刷新入口已连接。点击更新后按来源限频、分阶段更新。' : '后台已连接。点击更新后，各来源按限频采集，先发布公共来源，再补充微博。';
       return;
     }
@@ -50,24 +52,35 @@
   async function poll() {
     if (inFlight) return;
     inFlight = true;
+    if (reconnecting) { button.disabled = true; button.textContent = '连接中…'; }
     try {
-      const response = await fetch('/api/refresh/status', {cache:'no-store', signal:AbortSignal.timeout(12000)});
-      if (!(response.headers.get('Content-Type') || '').includes('application/json')) throw new Error('更新接口不可用，请确认本机后台服务。');
+      const response = await fetch('/api/refresh/status', {cache:'no-store', signal:AbortSignal.timeout(30000)});
+      if (!(response.headers.get('Content-Type') || '').includes('application/json')) throw new Error('状态接口返回异常。');
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || '后台暂不可用。');
       nonce = result.nonce;
       remote = result.mode === 'remote'; authenticated = !!result.authenticated;
+      reconnecting = false; failures = 0; lastConnectedAt = Date.now();
       render(result.job, result.cooldown_seconds);
       if (remote && !result.agent_online) status.textContent += ' 暂未收到本机后台近期心跳，任务可能正在等待接单或恢复连接。';
     } catch (error) {
-      button.disabled = true; button.textContent = '后台未连接';
-      status.textContent = error.message + ' 原有分类和缓存不受影响。';
+      reconnecting = true; failures += 1;
+      button.disabled = false; button.textContent = '重试连接';
+      const reason = navigator.onLine === false ? '网络已离线。'
+        : ['TimeoutError', 'AbortError'].includes(error.name) ? '读取更新状态超时。'
+        : error instanceof TypeError ? '暂时无法读取更新状态。' : error.message;
+      status.textContent = reason + ' 正在自动重连，也可点“重试连接”；不会重复发起采集。'
+        + (lastConnectedAt ? ' 上次连接：' + format(lastConnectedAt) : '');
     } finally {
       inFlight = false;
-      clearTimeout(timer); timer = setTimeout(poll, active || Date.now() < retryAt ? 5000 : 30000);
+      const delay = reconnecting ? Math.min(30000, 5000 * 2 ** Math.min(failures - 1, 3))
+        : active || Date.now() < retryAt ? 5000 : 30000;
+      clearTimeout(timer); timer = setTimeout(poll, delay);
     }
   }
   button.addEventListener('click', async () => {
+    // A recovery click is GET-only, even if the previous enqueue response was lost.
+    if (reconnecting) { clearTimeout(timer); await poll(); return; }
     if ((!nonce && !remote) || inFlight || active || Date.now() < retryAt) return;
     clearTimeout(timer); inFlight = true; button.disabled = true;
     button.textContent = '提交中…';
