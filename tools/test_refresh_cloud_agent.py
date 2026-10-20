@@ -32,6 +32,13 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(self.relay.accept({'id':'1234567890'}),'recovered')
         self.relay.local.assert_called_once_with('/status')
 
+    def test_cooldown_result_is_bound_without_submitting_a_request(self):
+        from datetime import datetime,timezone
+        self.relay.local=Mock(return_value={'cooldown_seconds':600,'job':{'id':'cooldown-job','terminal':True,
+            'finished_at':datetime.now(timezone.utc).isoformat()}})
+        self.assertEqual(self.relay.accept({'id':'1234567890'}),'cooldown-job')
+        self.relay.local.assert_called_once_with('/status')
+
     def test_daily_budget_fails_closed_and_survives_restart(self):
         self.relay.spend(750)
         with self.assertRaises(RuntimeError):self.relay.spend()

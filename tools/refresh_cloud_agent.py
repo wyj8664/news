@@ -22,6 +22,7 @@ from public_site_bundle import pack
 ROOT = Path(__file__).resolve().parents[1]
 ORIGIN = 'https://newshot-5jq.pages.dev'
 LOCAL = 'http://127.0.0.1:8801'
+USER_AGENT = 'NEWSHOT-Refresh-Agent/1.0 (+https://newshot-5jq.pages.dev)'
 
 
 def initialize(root=ROOT):
@@ -64,7 +65,7 @@ class Relay:
 
     def request(self,path,body=None,method=None):
         # Fixed origin and path; browser cannot supply destinations or shell args.
-        headers={'Authorization':'Bearer '+self.token}
+        headers={'Authorization':'Bearer '+self.token,'User-Agent':USER_AGENT}
         if body is not None:
             headers['Content-Type']='application/json'
             body=json.dumps(body,ensure_ascii=False).encode()
@@ -101,7 +102,8 @@ class Relay:
         # Recover an acknowledged-or-not local enqueue after relay restart.
         if attempted and job and datetime.fromisoformat(job['created_at']).timestamp()>=attempted-1:
             binding['job_id']=job['id']
-        elif job and not job['terminal']:
+        elif job and (not job['terminal'] or job.get('finished_at') and
+                      time.time()-datetime.fromisoformat(job['finished_at']).timestamp()<status.get('cooldown_seconds',600)):
             binding['job_id']=job['id']
         else:
             binding['attempted_at']=time.time(); self.put(key,binding)
@@ -113,7 +115,7 @@ class Relay:
     def upload(self,hash_value,data):
         self.spend()
         request=urllib.request.Request(ORIGIN+'/api/refresh/agent/asset?hash='+hash_value,data=data,
-            headers={'Authorization':'Bearer '+self.token,'Content-Type':'application/gzip'},method='PUT')
+            headers={'Authorization':'Bearer '+self.token,'Content-Type':'application/gzip','User-Agent':USER_AGENT},method='PUT')
         with urllib.request.urlopen(request,timeout=60) as response:
             if not json.load(response).get('ok'): raise RuntimeError('Asset upload not confirmed')
 
@@ -187,7 +189,8 @@ def main():
                 relay.tick()
             except Exception as error:
                 # No tokens, headers, request bodies or upstream diagnostics in logs.
-                print('Online refresh relay retryable failure: '+type(error).__name__,flush=True)
+                code=getattr(error,'code','')
+                print('Online refresh relay retryable failure: '+type(error).__name__+' '+str(code),flush=True)
                 if args.once: raise SystemExit(1) from None
             if args.once: return
             time.sleep(20)
