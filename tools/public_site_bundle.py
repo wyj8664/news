@@ -71,6 +71,8 @@ def pack(output, destination, archive=None):
     artifact=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()
     manifest={'schema_version':1,'artifact_id':artifact,'daily_date':match[1],
               'built_at':datetime.now(timezone.utc).isoformat(),'files':hashes}
+    generation=re.search(r'data-home-generation="([^"]+)"',(destination/'index.html').read_text())
+    if generation: manifest['generation']=generation[1]
     (destination/'site-manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2))
     if archive:
         archive=Path(archive);archive.parent.mkdir(parents=True,exist_ok=True)

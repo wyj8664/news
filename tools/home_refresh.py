@@ -26,7 +26,7 @@ def markup(generation):
       @media(max-width:600px) { .home-title-line { gap:10px; } #home-refresh-button { font-size:13px; } .refresh-source { grid-template-columns:1fr 70px; } .refresh-source span:nth-child(3), .refresh-source small { grid-column:1 / -1; } }
     </style>
     <section id="home-refresh-panel" data-generation=""" + '"' + escape(generation, quote=True) + '"' + """ aria-label="领域分类更新进度">
-      <p id="home-refresh-status" role="status" aria-live="polite">正在连接本机更新后台…</p>
+      <p id="home-refresh-status" role="status" aria-live="polite">正在连接更新后台…</p>
       <progress id="home-refresh-progress" value="0" max="1" hidden aria-label="来源更新进度"></progress>
       <details id="home-refresh-details" hidden><summary id="home-refresh-summary">查看来源进度</summary><div id="home-refresh-sources"></div></details>
       <div>后台分阶段更新，可关闭页面后回来查看。公共来源通常较快，微博按账号限频排队，可能超过5分钟；公众号仍停采。</div>

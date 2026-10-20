@@ -7,7 +7,7 @@
   const summary = document.getElementById('home-refresh-summary');
   const sources = document.getElementById('home-refresh-sources');
   const labels = {pending:'等待', running:'采集中', updated:'已更新', cached:'用缓存', partial:'部分更新', failed:'失败', paused:'已暂停', disabled:'未启用'};
-  let nonce = '', timer, inFlight = false, active = false, retryAt = 0;
+  let nonce = '', timer, inFlight = false, active = false, retryAt = 0, remote = false, authenticated = false;
   const format = value => {
     const date = new Date(value);
     return value && Number.isFinite(date.getTime()) ? date.toLocaleString('zh-CN', {timeZone:'Asia/Shanghai', hour12:false}) : '未知';
@@ -18,7 +18,7 @@
     button.disabled = active || Date.now() < retryAt;
     button.textContent = active ? '更新中…' : Date.now() < retryAt ? '冷却中' : '更新领域分类';
     if (!job) {
-      status.textContent = '后台已连接。点击更新后，各来源按限频采集，先发布公共来源，再补充微博。';
+      status.textContent = remote ? '刷新入口已连接。点击更新后按来源限频、分阶段更新。' : '后台已连接。点击更新后，各来源按限频采集，先发布公共来源，再补充微博。';
       return;
     }
     status.textContent = job.message + (Date.now() < retryAt ? ' 下一轮可发起时间：' + format(retryAt) : '');
@@ -39,8 +39,11 @@
     }
     const generation = job.published_generation;
     const seen = 'newshot-refresh-generation:' + job.id;
-    if (generation && Date.parse(generation) > Date.parse(panel.dataset.generation) && sessionStorage.getItem(seen) !== generation) {
-      sessionStorage.setItem(seen, generation);
+    if (generation && Date.parse(generation) <= Date.parse(panel.dataset.generation)) sessionStorage.removeItem(seen);
+    // Retry after edge propagation; do not permanently mark an unseen version as loaded.
+    const lastReload = Number(sessionStorage.getItem(seen) || 0);
+    if (generation && Date.parse(generation) > Date.parse(panel.dataset.generation) && Date.now()-lastReload > 30000) {
+      sessionStorage.setItem(seen, String(Date.now()));
       location.reload();
     }
   }
@@ -53,7 +56,9 @@
       const result = await response.json();
       if (!response.ok || !result.ok) throw new Error(result.error || '后台暂不可用。');
       nonce = result.nonce;
+      remote = result.mode === 'remote'; authenticated = !!result.authenticated;
       render(result.job, result.cooldown_seconds);
+      if (remote && !result.agent_online) status.textContent += ' 暂未收到本机后台近期心跳，任务可能正在等待接单或恢复连接。';
     } catch (error) {
       button.disabled = true; button.textContent = '后台未连接';
       status.textContent = error.message + ' 原有分类和缓存不受影响。';
@@ -63,14 +68,24 @@
     }
   }
   button.addEventListener('click', async () => {
-    if (!nonce || inFlight || active || Date.now() < retryAt) return;
+    if ((!nonce && !remote) || inFlight || active || Date.now() < retryAt) return;
     clearTimeout(timer); inFlight = true; button.disabled = true;
     button.textContent = '提交中…';
     try {
+      if (remote && !authenticated) {
+        const password = window.prompt('请输入管理员刷新口令（仅启动更新需要）');
+        if (password === null) return;
+        const login = await fetch('/api/refresh/login', {method:'POST', cache:'no-store',
+          headers:{'Content-Type':'application/json'},body:JSON.stringify({password}),signal:AbortSignal.timeout(12000)});
+        const session = await login.json();
+        if (!login.ok || !session.ok) throw new Error(session.error || '管理员验证失败。');
+        nonce = session.nonce; authenticated = true;
+      }
       const response = await fetch('/api/refresh/start', {method:'POST', cache:'no-store',
         headers:{'Content-Type':'application/json', 'X-Refresh-Nonce':nonce}, body:'{}', signal:AbortSignal.timeout(12000)});
       if (!(response.headers.get('Content-Type') || '').includes('application/json')) throw new Error('任务提交未确认，请查看后台状态后重试。');
       const result = await response.json();
+      if (response.status === 401) { authenticated = false; nonce = ''; }
       if (!response.ok || !result.ok) throw new Error(result.error || '任务提交未确认，请查看后台状态后重试。');
       render(result.job); details.open = true;
     } catch (error) {

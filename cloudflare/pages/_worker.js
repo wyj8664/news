@@ -61,7 +61,7 @@ export default {
 
     // Private local control plane: never inherit public data's wildcard CORS.
     if (url.pathname.startsWith("/api/refresh/")) {
-      return refreshControl(request, url);
+      return refreshControl(request, url, env);
     }
 
     if (request.method === "OPTIONS") {
@@ -75,9 +75,14 @@ export default {
         try { payload = env.NEWSHOT_WEIBO ? await env.NEWSHOT_WEIBO.get("weibo:followed:v1", {type: "json", cacheTtl: 60}) : null; } catch {}
         if (env.ASSETS) {
           try {
-            const snapshot = await env.ASSETS.fetch(new Request(new URL("/weibo/latest.json", request.url)));
+            const assetRequest = new Request(new URL("/weibo/latest.json", request.url));
+            const snapshot = await refreshAsset(assetRequest, new URL(assetRequest.url), env) || await env.ASSETS.fetch(assetRequest);
             if (snapshot.ok && (snapshot.headers.get("content-type") || "").includes("json")) {
-              const asset = await snapshot.json();
+              // KV overlay is stored gzip-compressed; Response bodies fetched internally
+              // do not receive the browser's transparent content decoding.
+              const asset = snapshot.headers.get('content-encoding')==='gzip'
+                ? await new Response(snapshot.body.pipeThrough(new DecompressionStream('gzip'))).json()
+                : await snapshot.json();
               const actual = new Set((payload?.accounts || []).map(account => String(account.id)));
               const missingAccount = (asset.accounts || []).some(account => !actual.has(String(account.id)));
               if (asset.ok && Array.isArray(asset.items) && (!payload?.ok || !Array.isArray(payload.items)
@@ -124,15 +129,20 @@ export default {
       }
     }
 
-    return env.ASSETS.fetch(request);
+    const refreshed = await refreshAsset(request, url, env);
+    return refreshed || env.ASSETS.fetch(request);
   },
 };
 
-async function refreshControl(request, url) {
+async function refreshControl(request, url, env) {
   const reply = (payload, status) => new Response(JSON.stringify(payload), {status, headers: {
     "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"
   }});
   if (!["127.0.0.1", "localhost"].includes(url.hostname) || url.port !== "8799") {
+    if (url.origin === 'https://newshot-5jq.pages.dev' && env.NEWSHOT_REFRESH && env.NEWSHOT_REFRESH_ADMIN_HASH && env.NEWSHOT_REFRESH_AGENT_HASH && env.NEWSHOT_REFRESH_SESSION_SECRET) {
+      try { return await remoteRefresh(request, url, env); }
+      catch { return refreshReply({ok:false, error:'刷新后台暂不可用，未确认的请求不会自动重试。'}, 503); }
+    }
     return reply({ok: false, available: false, error: "此按钮需要本机更新后台；当前线上网站尚未连接后台，未发起采集。"}, 503);
   }
   const path = url.pathname === "/api/refresh/status" ? "/status" : url.pathname === "/api/refresh/start" ? "/start" : null;
@@ -160,6 +170,156 @@ async function refreshControl(request, url) {
   } catch {
     return reply({ok: false, available: false, error: "本机更新后台未连接；请确认后台服务已启动。页面缓存仍可查看。"}, 503);
   }
+}
+
+// Outbound-only relay. Local SQLite/WeiboX remains authoritative for all limits.
+const REFRESH_ORIGIN = 'https://newshot-5jq.pages.dev';
+const refreshReply = (body, status=200, extra={}) => new Response(JSON.stringify(body), {status,
+  headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store',
+    'X-Content-Type-Options':'nosniff',...extra}});
+const refreshHex = bytes => Array.from(new Uint8Array(bytes), x=>x.toString(16).padStart(2,'0')).join('');
+async function refreshHash(value) {
+  return refreshHex(await crypto.subtle.digest('SHA-256', typeof value==='string' ? new TextEncoder().encode(value) : value));
+}
+function refreshEqual(a,b) {
+  if (typeof a!=='string' || typeof b!=='string' || a.length!==b.length) return false;
+  let diff=0; for(let i=0;i<a.length;i++) diff |= a.charCodeAt(i)^b.charCodeAt(i); return diff===0;
+}
+async function refreshSign(env, value) {
+  const key=await crypto.subtle.importKey('raw',new TextEncoder().encode(env.NEWSHOT_REFRESH_SESSION_SECRET),
+    {name:'HMAC',hash:'SHA-256'},false,['sign']);
+  return refreshHex(await crypto.subtle.sign('HMAC',key,new TextEncoder().encode(value)));
+}
+async function refreshSession(request,env) {
+  const token=(request.headers.get('Cookie')||'').match(/(?:^|;\s*)__Host-newshot_refresh=([^;]+)/)?.[1]||'';
+  const [expires,salt,signature]=token.split('.');
+  if (!/^\d{13}$/.test(expires||'') || !/^[a-f0-9]{32}$/.test(salt||'') || Number(expires)<Date.now()
+      || Number(expires)>Date.now()+9*3600000) return null;
+  if (!refreshEqual(signature,await refreshSign(env,expires+'.'+salt))) return null;
+  return {nonce:await refreshSign(env,'csrf:'+token)};
+}
+async function refreshBody(request,limit=4096) {
+  if ((request.headers.get('Content-Type')||'').split(';')[0]!=='application/json') throw new Error('JSON required');
+  if (Number(request.headers.get('Content-Length')||0)>limit) throw new Error('body too large');
+  const text=await request.text(); if(text.length>limit) throw new Error('body too large');
+  return JSON.parse(text);
+}
+async function refreshCommands(kv) {
+  const command=await kv.get('request:latest','json');
+  return command?[command]:[];
+}
+function refreshWaiting(command) {
+  const expired=Date.now()-Date.parse(command.created_at)>3600000;
+  return {id:command.id,state:expired?'failed':'queued',phase:expired?'done':'waiting-agent',
+    created_at:command.created_at,updated_at:command.created_at,finished_at:expired?command.created_at:null,
+    terminal:expired,done:0,total:0,sources:[],message:expired?'任务等待超过1小时，已过期；请在后台在线后重新发起。':'刷新请求已排队，等待本机后台接单。'};
+}
+function refreshSafeJob(job) {
+  if(!job || !/^[a-zA-Z0-9-]{1,80}$/.test(job.id||'') || !Array.isArray(job.sources) || job.sources.length>40) throw new Error('invalid job');
+  const result={};
+  for(const key of ['id','state','phase','created_at','updated_at','finished_at','message','published_generation','done','total','terminal']) {
+    if(['string','number','boolean'].includes(typeof job[key]) || job[key]===null) result[key]=typeof job[key]==='string'?job[key].slice(0,1200):job[key];
+  }
+  result.sources=job.sources.map(source=>Object.fromEntries(['id','name','state','message','fetched_at','count','next_allowed_at']
+    .filter(key=>['string','number','boolean'].includes(typeof source[key]) || source[key]===null)
+    .map(key=>[key,typeof source[key]==='string'?source[key].slice(0,1200):source[key]])));
+  return result;
+}
+function refreshPublicPath(name) {
+  return /^(?:index\.html|curated\/index\.html|daily\/(?:index\.html|latest\.md|20\d{2}-\d{2}-\d{2}\.(?:html|json|md))|timeline\/index\.html|hotlists\/(?:index\.html|weibo\/index\.html|telegraph\/(?:index\.html|latest\.json))|telegraph\/(?:index\.html|latest\.json)|assets\/weibo-feed\.js|weibo\/latest\.json|source-pool\/(?:home-events|cls-telegraph|jin10-all|jiemian-flash|status)\.json|markets\/quotes\.json|freshness\/report\.json)$/.test(name);
+}
+async function remoteRefresh(request,url,env) {
+  const kv=env.NEWSHOT_REFRESH, path=url.pathname.slice('/api/refresh/'.length);
+  if(path.startsWith('agent/')) {
+    const bearer=(request.headers.get('Authorization')||'').match(/^Bearer ([A-Za-z0-9_-]{32,100})$/)?.[1]||'';
+    if(!bearer || !refreshEqual(await refreshHash(bearer),env.NEWSHOT_REFRESH_AGENT_HASH)) return refreshReply({ok:false},401);
+    if(path==='agent/inbox' && request.method==='GET') {
+      return refreshReply({ok:true,commands:await refreshCommands(kv)});
+    }
+    if(path==='agent/status' && request.method==='POST') {
+      const body=await refreshBody(request,80000);
+      if(!/^\d{10}$/.test(body.request_id||'')) return refreshReply({ok:false},400);
+      const job=body.job ? refreshSafeJob(body.job) : null;
+      await kv.put('agent:status',JSON.stringify({request_id:body.request_id,job,seen_at:new Date().toISOString()}),{expirationTtl:86400});
+      return refreshReply({ok:true});
+    }
+    if(path==='agent/asset' && request.method==='PUT') {
+      const hash=url.searchParams.get('hash');
+      if(!/^[a-f0-9]{64}$/.test(hash||'') || request.headers.get('Content-Type')!=='application/gzip') return refreshReply({ok:false},400);
+      const bytes=await request.arrayBuffer();
+      if(bytes.byteLength>5000000 || await refreshHash(bytes)!==hash) return refreshReply({ok:false},400);
+      await kv.put('asset:'+hash,bytes,{expirationTtl:3*86400});
+      return refreshReply({ok:true});
+    }
+    if(path==='agent/publish' && request.method==='POST') {
+      const body=await refreshBody(request,20000);
+      if(!body.files || Object.keys(body.files).length>45 || !body.files['index.html'] || !Number.isFinite(Date.parse(body.generation))) return refreshReply({ok:false},400);
+      for(const [name,hash] of Object.entries(body.files)) {
+        if(!refreshPublicPath(name) || !/^[a-f0-9]{64}$/.test(hash)) return refreshReply({ok:false},400);
+        // Commit last. Missing uploads never switch the published pointer.
+        if(!(await kv.get('asset:'+hash,{type:'arrayBuffer'}))) return refreshReply({ok:false,error:'素材尚未同步，请稍后重试。'},409);
+      }
+      const previous=await kv.get('site:current','json');
+      if(previous && Date.parse(previous.generation)>Date.parse(body.generation)) return refreshReply({ok:false,error:'拒绝旧版本覆盖。'},409);
+      await kv.put('site:current',JSON.stringify({files:body.files,generation:body.generation,published_at:new Date().toISOString()}),{expirationTtl:2*86400});
+      return refreshReply({ok:true});
+    }
+    return refreshReply({ok:false},405);
+  }
+  if(path==='status' && request.method==='GET') {
+    const session=await refreshSession(request,env);
+    const command=(await refreshCommands(kv))[0]||null;
+    const report=await kv.get('agent:status','json');
+    const job=command && report?.request_id===command.id && report.job ? report.job : command?refreshWaiting(command):null;
+    const online=!!report && Date.now()-Date.parse(report.seen_at)<600000;
+    return refreshReply({ok:true,available:true,mode:'remote',authenticated:!!session,nonce:session?.nonce||'',
+      agent_online:online,job,cooldown_seconds:600});
+  }
+  if(!['login','start'].includes(path)) return refreshReply({ok:false},404);
+  if(request.method!=='POST') return refreshReply({ok:false},405);
+  if(request.headers.get('Origin')!==REFRESH_ORIGIN || request.headers.get('Sec-Fetch-Site')==='cross-site') return refreshReply({ok:false,error:'不允许跨站更新。'},403);
+  const body=await refreshBody(request);
+  if(path==='login') {
+    if(typeof body.password!=='string' || body.password.length>128 || !refreshEqual(await refreshHash(body.password),env.NEWSHOT_REFRESH_ADMIN_HASH)) return refreshReply({ok:false,error:'管理员口令不正确。'},401);
+    const prefix=(Date.now()+8*3600000)+'.'+crypto.randomUUID().replaceAll('-','');
+    const token=prefix+'.'+await refreshSign(env,prefix);
+    return refreshReply({ok:true,nonce:await refreshSign(env,'csrf:'+token)},200,
+      {'Set-Cookie':'__Host-newshot_refresh='+token+'; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=28800'});
+  }
+  const session=await refreshSession(request,env);
+  if(!session || !refreshEqual(request.headers.get('X-Refresh-Nonce'),session.nonce)) return refreshReply({ok:false,error:'请先验证管理员口令。'},401);
+  if(Object.keys(body).length) return refreshReply({ok:false},400);
+  const latest=await kv.get('agent:status','json');
+  if(latest?.job && (!latest.job.terminal || Date.now()-Date.parse(latest.job.finished_at)<600000)) return refreshReply({ok:true,created:false,job:latest.job});
+  const id=String(Math.floor(Date.now()/600000)*600).padStart(10,'0'), key='request:latest';
+  let command=await kv.get(key,'json');
+  // Single durable mailbox, coalesced by a ten-minute id; SQLite enforces the
+  // actual cooldown. No KV list calls or unbounded per-click records.
+  if(command?.id!==id) command=null;
+  const created=!command;
+  if(!command) { command={id,created_at:new Date().toISOString()}; await kv.put(key,JSON.stringify(command),{expirationTtl:86400}); }
+  return refreshReply({ok:true,created,job:refreshWaiting(command)},202);
+}
+async function refreshAsset(request,url,env) {
+  if(!env.NEWSHOT_REFRESH || !['GET','HEAD'].includes(request.method)) return null;
+  let name=url.pathname.replace(/^\//,''); if(!name || name.endsWith('/')) name+='index.html';
+  if(!refreshPublicPath(name)) return null;
+  try {
+    const current=await env.NEWSHOT_REFRESH.get('site:current','json');
+    const hash=current?.files?.[name]; if(!hash) return null;
+    if(env.ASSETS) {
+      const baseline=await env.ASSETS.fetch(new Request(new URL('/site-manifest.json',url)));
+      if(baseline.ok) {
+        const manifest=await baseline.json();
+        if(Date.parse(manifest.generation)>Date.parse(current.generation)) return null;
+      }
+    }
+    const bytes=await env.NEWSHOT_REFRESH.get('asset:'+hash,{type:'arrayBuffer'});
+    if(!bytes) return refreshReply({ok:false,error:'新版本正在同步，请稍后刷新。'},503,{'Retry-After':'30'});
+    const type=name.endsWith('.html')?'text/html; charset=utf-8':name.endsWith('.json')?'application/json; charset=utf-8':name.endsWith('.js')?'text/javascript; charset=utf-8':'text/plain; charset=utf-8';
+    return new Response(request.method==='HEAD'?null:bytes,{headers:{'Content-Type':type,'Content-Encoding':'gzip',
+      'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','X-Newshot-Generation':current.generation}});
+  } catch { return refreshReply({ok:false,error:'最新页面暂不可用，请稍后重试。'},503); }
 }
 
 async function fetchClsTelegraph(limit, pages, pageSize, windowStart) {
