@@ -1,4 +1,4 @@
-name: Inspect NEWSHOT refresh backend permissions
+name: Inspect or configure NEWSHOT refresh backend
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
-      - name: Inspect existing project and storage capabilities (read-only)
+      - name: Verify target and optionally configure the relay
         run: python3 tools/refresh_cloud_setup.py ${{ inputs.apply && '--apply' || '' }}
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
