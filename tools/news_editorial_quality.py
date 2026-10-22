@@ -9,6 +9,8 @@ HIRING_NOTICE = re.compile(
     r'(?:招聘|招录|招考).{0,12}(?:资格审查|体检|拟聘|拟录用).{0,8}(?:通知|公告|公示)|'
     r'(?:拟聘用|拟录用|拟聘任)人员.{0,8}公示'
 )
+HIRING_POLICY = re.compile(r'(?:招聘|就业|用工|人才).{0,12}(?:补贴政策|补贴标准|稳岗政策|扶持政策|税收优惠)')
+DIRECT_HIRING_AD = re.compile(r'(?:招聘|招录|招考)(?:公告|启事|简章|岗位表)')
 CIVIC_FILM_FORMAT = re.compile(r'微电影|宣传片|宣传视频|公益广告|普法短剧|普法微短剧|政务短剧')
 CIVIC_PRODUCER = re.compile(r'法院|法庭|检察院|司法局|司法厅|政法委|公安局|公安厅|派出所|消防|纪委|政府|政务|党组织')
 CIVIC_COMMUNICATION = re.compile(r'普法|法治宣传|反诈|禁毒|解纷|化解.{0,6}纠纷|纠纷调解|基层治理|警示教育|廉政|党建|文明宣传|宣传教育')
@@ -23,7 +25,7 @@ CULTURAL_INDUSTRY_FACT = re.compile(
 
 def rejection_reason(title, summary=''):
     text = re.sub(r'<[^>]+>', '', str(title)).strip()
-    if HIRING_NOTICE.search(text):
+    if HIRING_NOTICE.search(text) and (DIRECT_HIRING_AD.search(text) or not HIRING_POLICY.search(text)):
         return 'routine_hiring_notice'
     opening = re.sub(r'<[^>]+>', '', str(summary))[:300]
     if (CIVIC_FILM_FORMAT.search(text) and not CULTURAL_INDUSTRY_FACT.search(text)
