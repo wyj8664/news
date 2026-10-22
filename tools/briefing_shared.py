@@ -410,6 +410,10 @@ def select_snapshot(snapshot, history, now, batch, *, limit=20):
             continue
         docs = {doc["doc_id"]: doc for doc in event["reports"]}
         for progress in event["progresses"]:
+            identity=progress.get('fact_identity') or {}
+            if identity.get('family')=='consumer-safety' and identity.get('action')=='background':
+                reasons['consumer_background_not_new_progress']+=1
+                continue
             key = canonical_progress(progress["id"], aliases)
             at = parse_publication_time(progress["first_reported_at"])
             if key in sent:

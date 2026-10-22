@@ -11,6 +11,7 @@ import urllib.parse
 from news_freshness import china_time
 from news_fact_normalization import canonical_quantities, reporting_period
 from news_fact_identity import fact_identity, same_fact, policy_conflict, dated_policy, same_policy
+from news_consumer_incidents import incident_identity, same_incident
 
 PUBLISHERS = {
     "cls-hot": "cls", "cls-telegraph": "cls", "jin10-flash": "jin10", "jin10-all": "jin10",
@@ -191,6 +192,7 @@ class Features:
     issues: set[str] = None
     fact: dict | None = None
     published_day: str = ''
+    consumer_incident: dict | None = None
 
 
 def features(item) -> Features:
@@ -264,11 +266,16 @@ def features(item) -> Features:
         if products and issues:
             actions.add("quality")
     published = getattr(item,'published_dt',None) or getattr(item,'first_dt',None)
+    day = china_time(published).strftime('%Y-%m-%d') if published else ''
+    incident = incident_identity(clean_headline(item), str(item.summary or '')[:700], day)
+    if incident:
+        products.add(incident['object'])
+        actions.add('quality')
     return Features(text, actors, actions, object_grams, grams(text) | grams(text, 3), quarters, models,
                     article_url(item.url), digest, quake_time, views, products, subject, dates, issues,
                     dated_policy(fact_identity(clean_headline(item), str(item.summary or '')[:700]),
                                  china_time(published).strftime('%Y-%m-%d') if published else ''),
-                    china_time(published).strftime('%Y-%m-%d') if published else '')
+                    day, incident)
 
 
 def same_event(left: Features, right: Features, idf: dict[str, float]) -> bool:
@@ -347,6 +354,9 @@ def event_match(left: Features, right: Features) -> tuple[float, str]:
         return 0, "conflicting-quality-issue"
     if left.quake_time and right.quake_time and left.quake_time.isdisjoint(right.quake_time):
         return 0, "conflicting-quake-time"
+    consumer = same_incident(left.consumer_incident,right.consumer_incident)
+    if consumer is not None:
+        return (.98,'same-branded-product-safety-episode') if consumer else (0,'conflicting-product-safety-episode')
     if left.digest or right.digest:
         return (1, "same-digest") if left.text == right.text else (0, "multi-event-digest")
     shared_entities = left.entities & right.entities

@@ -27,6 +27,7 @@ from news_freshness import CHINA, WINDOW_HOURS, china_time, parse_publication_ti
 from news_event_clustering import deduplicate_reports, group_event_items, publisher_id, publisher_name, safe_link, ACTION_RULES
 from event_registry import EventRegistry, Progress as HomeProgress, TYPE_LABELS, clean_headline, document_id
 from home_categories import CATEGORY_ORDER as HOME_CATEGORY_ORDER, category_label as home_category_label, classify_event as classify_home_event
+from news_consumer_incidents import is_background as consumer_background
 from jin10_public import public_jin10_record
 from jiemian_flash import SOURCE_ID as JIEMIAN_SOURCE_ID, SOURCE_NAME as JIEMIAN_SOURCE_NAME, LIST_URL as JIEMIAN_LIST_URL
 from news_ranking import POLICY as RANKING_POLICY, rank_progress, card_rank, sort_key, epoch_millis
@@ -1115,6 +1116,9 @@ def event_progress_ranking(event: Event, now: datetime) -> list[dict]:
         [item.doc_id or document_id(item) for item in event.items])]
     result = []
     for node in nodes:
+        if consumer_background(node.identity):
+            result.append({'id':node.key,**rank_progress(0,node.first_reported_at,now)})
+            continue
         first = china_time(node.first_reported_at).replace(tzinfo=None)
         publishers = {}
         for item in node.items:
@@ -1137,7 +1141,8 @@ def event_progress_ranking(event: Event, now: datetime) -> list[dict]:
 
 def live_event_sort_key(event: Event, now: datetime):
     ranking = event_progress_ranking(event, now)
-    latest = max(node['first_reported_at'] for node in ranking)
+    factual={node.key for node in event.progresses if not consumer_background(node.identity)}
+    latest = max(node['first_reported_at'] for node in ranking if not factual or node['id'] in factual)
     return sort_key(card_rank(ranking), latest, event.key)
 
 
@@ -1656,7 +1661,8 @@ def home_event_row(event: Event, rank: int, *, dynamic: bool = True,
     related_items = sorted(event.items, key=lambda item: (item.published_dt, item.source_trust), reverse=True)
     nodes = []
     progresses = sorted(event.progresses, key=lambda progress: (progress.first_reported_at, progress.key), reverse=True)
-    last_progress_ms = epoch_millis(max((china_time(progress.first_reported_at) for progress in progresses),
+    factual_progresses=[progress for progress in progresses if not consumer_background(progress.identity)]
+    last_progress_ms = epoch_millis(max((china_time(progress.first_reported_at) for progress in factual_progresses),
                               default=max(published)))
     for progress in progresses:
         related = "".join(
@@ -1670,7 +1676,7 @@ def home_event_row(event: Event, rank: int, *, dynamic: bool = True,
                      f'<ul class="related">{related}</ul></section>')
     details = (f'<details class="event-progress"><summary>同一事件 · {len(progresses)} 个进展 · {len(related_items)} 条来源报道</summary>{"".join(nodes)}</details>'
                if len(related_items) > 1 or len(progresses) > 1 else "")
-    latest = (f'<div class="latest-progress">最新进展：{e(progresses[0].title)}</div>' if len(progresses) > 1 else "")
+    latest = (f'<div class="latest-progress">最新进展：{e(factual_progresses[0].title)}</div>' if len(progresses) > 1 and factual_progresses else "")
     tags = []
     tags.append(f'<span class="mini-chip hot">{e(home_category_label(event.category))}</span>')
     tags.extend([

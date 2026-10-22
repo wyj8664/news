@@ -26,8 +26,9 @@ from news_event_clustering import (
 from news_freshness import china_time
 from news_fact_normalization import financial_scope, quantity_tokens, scopes_conflict
 from news_fact_identity import fact_identity, same_fact, event_key, market_parts, market_fact, policy_objects, policy_conflict, dated_policy
+from news_consumer_incidents import incident_statements, same_incident, repeated_action_response
 
-VERSION = 5
+VERSION = 8
 MAX_CANDIDATES = 40
 MAX_REPRESENTATIVES = 4
 TYPE_LABELS = {
@@ -71,6 +72,9 @@ def block_keys(value):
         keys.add('entity:fact:' + event_key(value.fact))
     if value.subject:
         keys.add("entity:" + value.subject)
+    if value.consumer_incident:
+        keys.update('entity:consumer:'+brand+'|'+value.consumer_incident['object']
+                    for brand in value.consumer_incident['brands'])
     # Long concrete fragments recall unlisted universities/venues/products too.
     for text in value.views or (value.text,):
         keys.update("gram:" + token for token in grams(text, 4))
@@ -91,6 +95,15 @@ def statement_identity(value):
 
 def enriched_claim(old,new):
     a,b=statement_identity(old),statement_identity(new)
+    if a and b and a['family']==b['family']=='consumer-safety' and same_fact(a,b):
+        enriched={**a}
+        for key in ('scope','stance','detail','stage'):
+            enriched[key]=a.get(key) or b.get(key,'')
+        for key in ('brands','issues','batches','models'):
+            enriched[key]=sorted(set(a.get(key,[]))|set(b.get(key,[])))
+        if b.get('date_explicit') and not a.get('date_explicit'):
+            enriched.update(incident_day=b['incident_day'],date_explicit=True)
+        return 'fact:'+json.dumps(enriched,ensure_ascii=False,sort_keys=True)
     if a and b and a['family']==b['family']=='policy' and same_fact(a,b):
         enriched={**a}
         for key in ('reference','effective_date'):
@@ -118,6 +131,11 @@ def statements(item):
     text = re.sub(r"#([^#]+)#", r"\1", head)
     body = str(item.summary or "")[:700]
     combined = text + "\n" + body
+    published = getattr(item,'published_dt',None) or getattr(item,'first_dt',None)
+    consumer = incident_statements(text, body, china_time(published).strftime('%Y-%m-%d') if published else '')
+    if consumer:
+        return [Statement(kind,title,'fact:'+json.dumps(identity,ensure_ascii=False,sort_keys=True),amount_tokens(title))
+                for kind,title,identity in consumer]
     def dated(identity):
         at=getattr(item,'published_dt',None) or getattr(item,'first_dt',None)
         if at:
@@ -140,7 +158,7 @@ def statements(item):
         if re.search(r"检出|超标|不合格", disclosure) and not re.match(r"^(?:客服|官方|公司).{0,4}回应", disclosure):
             disclosure = re.sub(r"^(?:官方|客服).*?回应", "", disclosure)
             results.append(Statement("report", disclosure, "quality-disclosure"))
-    if response:
+    if response and not repeated_action_response(text):
         claim = ""
         title = text
         for pattern, key in (
@@ -372,6 +390,15 @@ class EventRegistry:
         self.reconcile_progresses(canonical)
         return canonical
 
+    def consumer_compatible(self, value, event_id):
+        """An unspecified report must not bridge known conflicting issues/lots."""
+        if not value.consumer_incident:
+            return True
+        rows=self.db.execute('''SELECT d.* FROM docs d JOIN event_docs ed ON ed.doc_id=d.id
+            WHERE ed.event_id=? AND d.feature<>'' ORDER BY d.published DESC LIMIT ?''',
+            (event_id,MAX_CANDIDATES)).fetchall()
+        return all(same_incident(value.consumer_incident,self.feature(row).consumer_incident) is not False for row in rows)
+
     def reconcile_progresses(self, event_id):
         rows = self.db.execute("SELECT * FROM progresses WHERE event_id=? AND merged_into IS NULL ORDER BY first_reported,rowid", (event_id,)).fetchall()
         representatives = []
@@ -400,6 +427,7 @@ class EventRegistry:
         """
         head=clean_headline(item)
         fresh=statements(item)
+        consumer=bool(fresh and any(statement_identity(s) and statement_identity(s)['family']=='consumer-safety' for s in fresh))
         rows=self.db.execute('''SELECT p.* FROM progresses p JOIN progress_docs pd ON pd.progress_id=p.id
             WHERE pd.doc_id=? AND p.merged_into IS NULL''',(document_id(item),)).fetchall()
         for row in rows:
@@ -410,11 +438,14 @@ class EventRegistry:
                 self.db.execute('DELETE FROM progress_docs WHERE progress_id=? AND doc_id=?',(row['id'],document_id(item)))
                 self.stats['policy_document_links_repaired']+=1
                 continue
-            if normalize(row['title'])!=normalize(head) and row['title'] not in {'研选•行业数据','研选·行业数据'}:
+            if (normalize(row['title'])!=normalize(head) and row['title'] not in {'研选•行业数据','研选·行业数据'}
+                    and not (consumer and len(normalize(row['title']))>=6 and normalize(row['title']) in normalize(head))):
                 continue
             generic=row['title'] in {'研选•行业数据','研选·行业数据'}
             promote = generic or any(statement_identity(s) and statement_identity(s)['family'] in {'press-release','usage-response','capacity-approval','policy'} for s in fresh)
             candidates=fresh if promote else [s for s in fresh if s.kind==row['kind']]
+            if consumer:
+                candidates=[s for s in fresh if s.kind==row['kind']] or (fresh if len(fresh)==1 else [])
             if candidates:
                 new=candidates[0]
                 old=Statement(row['kind'],row['title'],row['claim'])
@@ -454,6 +485,9 @@ class EventRegistry:
             (SELECT pd.doc_id FROM progress_docs pd JOIN progresses p ON p.id=pd.progress_id WHERE p.event_id=?)''',(event_id,event_id))
 
     def supporting_statement(self, item, value, statement, event_id):
+        supported=self.consumer_supporting_statement(statement,event_id)
+        if supported:
+            return supported
         # A publisher may use a poetic website title and quote that exact title
         # inside its own factual Weibo headline. This is supporting coverage,
         # not a new, content-free progress node.
@@ -468,6 +502,40 @@ class EventRegistry:
             if normalize(statement.title) in old.views:
                 return Statement(row["kind"], row["title"], row["claim"], tuple(json.loads(row["numbers"])))
         return statement
+
+    def consumer_supporting_statement(self, statement, event_id):
+        """An identical, truncated caption can use a proven action's evidence.
+
+        Exact published headline agreement is required; a shared hashtag or a
+        vague response cannot borrow another article's unrelated factual claim.
+        """
+        if statement_identity(statement):
+            return None
+        kind=statement.kind
+        if kind=='response' and repeated_action_response(statement.title):
+            kind='withdrawal' if '下架' in statement.title else 'recall'
+        if kind not in {'withdrawal','recall'}:
+            return None
+        rows=self.db.execute('''SELECT p.*,d.feature FROM progresses p
+            JOIN progress_docs pd ON pd.progress_id=p.id JOIN docs d ON d.id=pd.doc_id
+            WHERE p.event_id=? AND p.kind=? AND p.merged_into IS NULL AND d.feature<>''
+            ORDER BY p.first_reported,p.rowid''',(event_id,kind)).fetchall()
+        head=normalize(statement.title)
+        for row in rows:
+            old=Statement(row['kind'],row['title'],row['claim'],tuple(json.loads(row['numbers'])))
+            identity=statement_identity(old)
+            if identity and identity['family']=='consumer-safety' and head in decode_feature(row['feature']).views:
+                return old
+        return None
+
+    def repair_consumer_captions(self,event_id):
+        rows=self.db.execute("SELECT * FROM progresses WHERE event_id=? AND merged_into IS NULL",(event_id,)).fetchall()
+        for row in rows:
+            old=Statement(row['kind'],row['title'],row['claim'],tuple(json.loads(row['numbers'])))
+            supported=self.consumer_supporting_statement(old,event_id)
+            if supported:
+                self.db.execute('UPDATE progresses SET kind=?,claim=?,numbers=? WHERE id=?',
+                    (supported.kind,supported.claim,json.dumps(supported.numbers),row['id']))
 
     def promote_caption(self, item, value, statement, event_id):
         # Inverse of supporting_statement: the website teaser may arrive first.
@@ -533,7 +601,7 @@ class EventRegistry:
                         compared[event_id] += 1
                         self.stats["event_pair_checks"] += 1
                         score, reason = event_match(value, self.feature(candidate))
-                        if score >= .85 and score > matches.get(event_id, (0, ""))[0]:
+                        if score >= .85 and score > matches.get(event_id, (0, ""))[0] and self.consumer_compatible(value,event_id):
                             matches[event_id] = (score, reason)
                             representatives[event_id] = self.feature(candidate)
                 existing_owner = self.resolve("events", owners[0][0]) if owners else None
@@ -599,6 +667,7 @@ class EventRegistry:
             # The older stable ID survives and the removed identity becomes an
             # alias, so previous Feishu ACKs continue to suppress repeats.
             for event_id in {self.resolve('events', key) for key in affected_events}:
+                self.repair_consumer_captions(event_id)
                 self.reconcile_progresses(event_id)
                 self.repair_policy_boundaries(event_id)
             self.db.commit()

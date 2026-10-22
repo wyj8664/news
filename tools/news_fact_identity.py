@@ -12,6 +12,7 @@ import re
 import unicodedata
 
 from news_fact_normalization import NUMBER, canonical_quantities, decimal_text
+from news_consumer_incidents import same_incident_progress
 
 
 def compact(text):
@@ -310,6 +311,8 @@ def same_fact(a,b):
         return None
     if a['family'] != b['family']:
         return False
+    if a['family']=='consumer-safety':
+        return same_incident_progress(a,b)
     if a['family']=='policy':
         return (same_policy(a,b) and a.get('stage')==b.get('stage')
                 and not (a.get('effective_date') and b.get('effective_date') and a['effective_date']!=b['effective_date']))

@@ -10,6 +10,7 @@ import re
 from typing import Iterable
 from news_editorial_quality import rejection_reason
 from news_fact_normalization import financial_scope
+from news_consumer_incidents import incident_identity
 
 
 CATEGORY_LABELS = {
@@ -377,6 +378,8 @@ def classify_text(title: str, summary: str = "") -> str:
     product = re.search(r"发布|推出|投产|量产|研发|突破|新车|交付|销量|财报|营收|利润", focus)
     if quote and not product and (not scores["commodities"] or re.search(r"(?<![a-z])ETF(?![a-z])|基金|股票|板块|股价", focus, re.I)):
         return "finance"
+    if incident_identity(focus,_clean(summary)):
+        return 'consumer'
     # Concrete products/projects take precedence over a multi-sector brand.
     best_industry = max(industry, key=lambda category: scores[category])
     if scores[best_industry] and scores["finance"] <= 4:
