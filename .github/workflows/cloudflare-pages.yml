@@ -7,8 +7,8 @@ on:
         description: Deploy the approved local public snapshot without recollecting
         type: boolean
         default: false
-  schedule:
-    - cron: "17 */2 * * *"
+  # Automatic collection/publishing is owned by the local durable daytime
+  # queue. Keep manual deployments, but do not run another night/weekend crawler.
 
 concurrency:
   group: cloudflare-pages
