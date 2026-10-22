@@ -407,11 +407,13 @@ def classify_text(title: str, summary: str = "") -> str:
 def classify_event(title: str, items: Iterable[object]) -> str:
     """The selected headline leads; other reports supply context, not vote spam."""
     reports = list(items)
+    matching = next((item for item in reports if item.title == title), None)
+    if rejection_reason(_clean(title), matching.summary if matching else ""):
+        return ALL_ONLY_CATEGORY
     if financial_instrument_news(headline_focus(title)):
         return "finance"
     if military_politics_only(title):
         return ALL_ONLY_CATEGORY
-    matching = next((item for item in reports if item.title == title), None)
     primary = classify_text(title, matching.summary if matching else "")
     if primary not in {"society", ALL_ONLY_CATEGORY}:
         return primary
