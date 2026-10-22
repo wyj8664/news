@@ -270,7 +270,9 @@ async function remoteRefresh(request,url,env) {
     const [session,commands,report]=await Promise.all([
       refreshSession(request,env),refreshCommands(kv),kv.get('agent:status','json')]);
     const command=commands[0]||null;
-    const job=command && report?.request_id===command.id && report.job ? report.job : command?refreshWaiting(command):null;
+    // A trusted scheduled job needs no browser command. A newer manual
+    // request still takes priority until the agent acknowledges its exact ID.
+    const job=command ? (report?.request_id===command.id && report.job ? report.job : refreshWaiting(command)) : report?.job||null;
     const online=!!report && Date.now()-Date.parse(report.seen_at)<600000;
     return refreshReply({ok:true,available:true,mode:'remote',authenticated:!!session,nonce:session?.nonce||'',
       agent_online:online,job,cooldown_seconds:600});
